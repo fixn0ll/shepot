@@ -1,0 +1,20 @@
+{
+    "name": "shepot",
+    "description": "Shepot — Push-to-Talk voice-to-text dictation for Windows powered by whisper.cpp",
+    "targetType": "executable",
+    "targetPath": "bin",
+    "libs-windows": ["user32", "winmm", "shell32", "gdi32", "comctl32", "advapi32"],
+    "buildTypes": {
+        "debug": {
+            "buildOptions": ["debugMode", "debugInfo"],
+            "lflags-windows": ["/SUBSYSTEM:WINDOWS", "/ENTRY:wmainCRTStartup", "assets/app.res"]
+        },
+        "release": {
+            "buildOptions": ["releaseMode", "optimize", "inline"],
+            "lflags-windows": ["/SUBSYSTEM:WINDOWS", "/ENTRY:wmainCRTStartup", "assets/app.res"]
+        },
+        "unittest": {
+            "buildOptions": ["unittests", "debugMode", "debugInfo"]
+        }
+    }
+}

@@ -1,0 +1,8 @@
+.dub/
+bin/*.exe
+bin/*.dll
+bin/*.pdb
+bin/models/*.bin
+bin/*.part
+bin/*.nupkg
+tmp_*

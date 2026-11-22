@@ -1,0 +1,19 @@
+{
+    "whisperDll": "whisper.dll",
+    "modelPath": "models/ggml-large-v3-turbo-q5_0.bin",
+    "language": "ru",
+    "threads": 4,
+    "useGpu": true,
+    "autoLoadModel": true,
+    "unloadTimeoutMin": 5,
+    "hotkey": "F9",
+    "micDevice": -1,
+    "minDurationSec": 0.3,
+    "rmsThreshold": 0.0015,
+    "pasteViaClipboard": true,
+    "clipboardRestoreDelayMs": 120,
+    "beep": true,
+    "showOverlay": true,
+    "livePreview": true,
+    "startMinimized": false
+}
