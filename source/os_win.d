@@ -5,8 +5,9 @@ import core.stdc.string : memcpy;
 import core.sync.mutex : Mutex;
 import core.sys.windows.commctrl;
 import core.sys.windows.shellapi;
-import core.sys.windows.winbase : CloseHandle, CreateMutexW, GetLastError, GetModuleHandleW,
-    GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE;
+import core.sys.windows.winbase : CloseHandle, CreateMutexW, GetFileType, GetLastError,
+    GetModuleHandleW, GetStdHandle, GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    STD_OUTPUT_HANDLE;
 import core.sys.windows.wincon : AllocConsole, ATTACH_PARENT_PROCESS, AttachConsole,
     FreeConsole, SetConsoleCP, SetConsoleOutputCP;
 import core.sys.windows.windef : BYTE, COLORREF, DWORD, ERROR_SUCCESS, FALSE, HBITMAP, HBRUSH, HDC, HFONT,
@@ -247,8 +248,9 @@ void releaseSingleInstance() {
     }
 }
 
-/// Подключает родительскую консоль (для CLI-режима --check / --setup).
+/// Подключает родительскую консоль (для CLI-режима --check / --setup), не ломая перенаправление в pipe/файл.
 void attachParentConsoleIfAny() {
+    if (GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != 0) return;
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         freopen("CONOUT$", "w", stdout);
         freopen("CONOUT$", "w", stderr);

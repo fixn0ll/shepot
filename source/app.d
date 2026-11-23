@@ -1,9 +1,10 @@
 module app;
 
 import audio : AudioCapture, listInputDevices;
-import bootstrap : downloadModel, ensureAssets;
-import config : AppConfig, loadConfig, normalizeEngine, normalizeInputMode, parseHotkeyVk,
-    resolvePath, saveConfig, vkToKeyName;
+import bootstrap : downloadModel, downloadSherpaModel, downloadSherpaRuntime,
+    downloadVulkanRuntime, ensureAssets, hasAllStartupAssets, isSherpaModelReady;
+import config : AppConfig, applyModelPreset, builtinModelPresets, loadConfig, modelOptionId,
+    normalizeEngine, normalizeInputMode, parseHotkeyVk, resolvePath, saveConfig, vkToKeyName;
 import core.atomic : atomicLoad, atomicStore;
 import core.time : MonoTime;
 import os_win : acquireSingleInstance, attachParentConsoleIfAny, closeTempConsole,
@@ -17,8 +18,8 @@ import std.algorithm.searching : any, canFind;
 import std.concurrency : OwnerTerminated, receive, send, spawn, Tid;
 import std.file : exists;
 import std.format : format;
-import std.path : baseName;
-import std.stdio : writeln, writefln;
+import std.path : baseName, dirName;
+import std.stdio : stdout, writeln, writefln;
 import stt : WhisperRecognizer;
 import stt_engine : calcRms, isSpeechValid, SAMPLE_RATE, SttEngine, tailPreview;
 import stt_sherpa : SherpaRecognizer;
@@ -41,7 +42,7 @@ private enum WorkerCmd {
 }
 
 private struct SwitchModelMsg {
-    string modelPath;
+    AppConfig cfg;
     bool reloadNow;
 }
 
@@ -61,6 +62,7 @@ private struct SharedState {
     bool beepEnabled;
     bool livePreview;
     bool previewBusy;
+    bool workerExited;
     int unloadTimeoutMin;
     int inputModeCode; // 0 = sendinput, 1 = clipboard, 2 = auto
     ulong lastActivityMs;
@@ -93,17 +95,18 @@ private ulong nowMs() {
     return cast(ulong)(MonoTime.currTime - g_baseTime).total!"msecs";
 }
 
-private UiOption[] buildModelOptions(string currentModelPath) {
-    UiOption[] opts = [
-        UiOption("tiny (~75 МБ, сверхбыстрая)", "models/ggml-tiny.bin"),
-        UiOption("base (~142 МБ, быстрая)", "models/ggml-base.bin"),
-        UiOption("small-q5_1 (~182 МБ, лёгкая для CPU)", "models/ggml-small-q5_1.bin"),
-        UiOption("medium-q5_0 (~515 МБ, баланс)", "models/ggml-medium-q5_0.bin"),
-        UiOption("large-v3-turbo-q5_0 (~547 МБ, рекомендуется)", "models/ggml-large-v3-turbo-q5_0.bin"),
-        UiOption("large-v3-turbo-q8_0 (~834 МБ, макс. точность)", "models/ggml-large-v3-turbo-q8_0.bin"),
-    ];
-    if (!opts.any!(o => o.value == currentModelPath)) {
-        opts ~= UiOption(baseName(currentModelPath) ~ " (пользовательская)", currentModelPath);
+private UiOption[] buildModelOptions(const ref AppConfig cfg) {
+    UiOption[] opts;
+    opts.reserve(builtinModelPresets.length + 1);
+    foreach (p; builtinModelPresets) {
+        opts ~= UiOption(p.label, p.id);
+    }
+    auto curId = modelOptionId(cfg);
+    if (!opts.any!(o => o.value == curId)) {
+        auto label = normalizeEngine(cfg.engine) == "sherpa"
+            ? ("Sherpa (пользовательская): " ~ baseName(cfg.sherpaEncoder.length ? cfg.sherpaEncoder : cfg.sherpaCtcModel))
+            : (baseName(cfg.modelPath) ~ " (пользовательская)");
+        opts ~= UiOption(label, curId);
     }
     return opts;
 }
@@ -131,20 +134,55 @@ private void onWhisperProgress(int pct) nothrow {
     uiSetProgress(2, pct);
 }
 
-private bool ensureModelDownloadedUi(string modelRelPath) {
-    auto absPath = resolvePath(modelRelPath);
-    if (exists(absPath)) return true;
+private bool ensureRuntimeUi(const ref AppConfig curCfg) {
+    bool isSherpa = normalizeEngine(curCfg.engine) == "sherpa";
+    auto dllPath = resolvePath(isSherpa ? curCfg.sherpaDll : curCfg.whisperDll);
+    if (exists(dllPath)) return true;
 
-    auto name = baseName(absPath);
+    auto label = isSherpa ? "sherpa-onnx DLL" : "Whisper Vulkan DLL";
+    uiSetModelState(false, true);
+    uiSetStatus(format("Скачивание %s: 0%%...", label));
+    uiSetProgress(2, 0);
+    uiLog("[DL] Начато скачивание " ~ label ~ "...");
+
+    auto cb = (int pct) {
+        uiSetProgress(2, pct);
+        uiSetStatus(format("Скачивание %s: %s%%...", label, pct));
+    };
+    bool ok = isSherpa
+        ? downloadSherpaRuntime(dirName(dllPath), cb)
+        : downloadVulkanRuntime(dirName(dllPath), cb);
+
+    uiSetProgress(0, 0);
+    if (!ok) {
+        uiLog("[DL ОШИБКА] Не удалось скачать " ~ label);
+        uiSetModelState(false, false);
+        uiSetIdleStatus(false);
+        return false;
+    }
+    uiLog("[DL] Установлены библиотеки " ~ label);
+    return true;
+}
+
+private bool ensureModelDownloadedUi(const ref AppConfig curCfg) {
+    bool isSherpa = normalizeEngine(curCfg.engine) == "sherpa";
+    if (isSherpa ? isSherpaModelReady(curCfg) : exists(resolvePath(curCfg.modelPath))) {
+        return true;
+    }
+
+    auto name = isSherpa ? modelOptionId(curCfg) : baseName(curCfg.modelPath);
     uiSetModelState(false, true);
     uiSetStatus(format("Скачивание %s: 0%%...", name));
     uiSetProgress(2, 0);
     uiLog(format("[DL] Начато скачивание модели %s...", name));
 
-    bool ok = downloadModel(absPath, (int pct) {
+    auto cb = (int pct) {
         uiSetProgress(2, pct);
         uiSetStatus(format("Скачивание %s: %s%%...", name, pct));
-    });
+    };
+    bool ok = isSherpa
+        ? downloadSherpaModel(curCfg, cb)
+        : downloadModel(resolvePath(curCfg.modelPath), cb);
 
     uiSetProgress(0, 0);
     if (!ok) {
@@ -157,7 +195,7 @@ private bool ensureModelDownloadedUi(string modelRelPath) {
     return true;
 }
 
-private bool ensureModelLoaded(SttEngine recognizer, bool notifyCue) {
+private bool ensureModelLoaded(SttEngine recognizer, const ref AppConfig curCfg, bool notifyCue) {
     if (recognizer.isLoaded()) {
         atomicStore(g_state.modelLoaded, true);
         atomicStore(g_state.modelLoading, false);
@@ -169,12 +207,10 @@ private bool ensureModelLoaded(SttEngine recognizer, bool notifyCue) {
     atomicStore(g_state.modelLoading, true);
     uiSetModelState(false, true);
 
-    if (recognizer.supportsRemoteDownload() && !exists(recognizer.modelPath())) {
-        if (!ensureModelDownloadedUi(recognizer.modelPath())) {
-            atomicStore(g_state.modelLoading, false);
-            uiSetLoadWaiting(false);
-            return false;
-        }
+    if (!ensureRuntimeUi(curCfg) || !ensureModelDownloadedUi(curCfg)) {
+        atomicStore(g_state.modelLoading, false);
+        uiSetLoadWaiting(false);
+        return false;
     }
 
     uiSetStatus(format("Загрузка модели (%s)...", recognizer.useGpu() ? "GPU" : "CPU"));
@@ -217,11 +253,16 @@ private void unloadModelNow(SttEngine recognizer, string reason) {
 
 private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPtr, immutable AppConfig cfg) {
     auto audio = cast(AudioCapture*) audioPtr;
-    auto recognizer = *cast(SttEngine*) sttPtr;
+    SttEngine recognizer = *cast(SttEngine*) sttPtr;
+    AppConfig curCfg = cfg;
+    scope (exit) {
+        if (recognizer !is null) recognizer.close();
+        atomicStore(g_state.workerExited, true);
+    }
     ReplacementStore replacements;
 
     if (cfg.autoLoadModel) {
-        if (ensureModelLoaded(recognizer, false)) {
+        if (ensureModelLoaded(recognizer, curCfg, false)) {
             uiSetIdleStatus(true);
         }
     }
@@ -231,50 +272,75 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
         try {
             receive(
                 (SwitchModelMsg msg) {
-                    bool needReload = recognizer.isLoaded() || msg.reloadNow;
-                    if (recognizer.isLoaded()) {
-                        unloadModelNow(recognizer, "Смена модели...");
+                    bool needReload = (recognizer !is null && recognizer.isLoaded()) || msg.reloadNow;
+                    if (recognizer !is null) {
+                        if (recognizer.isLoaded()) unloadModelNow(recognizer, "Смена модели...");
+                        recognizer.close();
+                        recognizer = null;
                     }
-                    recognizer.setModelPath(msg.modelPath);
+                    atomicStore(g_state.modelLoaded, false);
+                    uiSetModelState(false, false);
+
+                    curCfg = msg.cfg;
+                    if (!ensureRuntimeUi(curCfg)) {
+                        uiSetIdleStatus(false);
+                        return;
+                    }
+
+                    auto nextRec = createSttEngine(curCfg);
+                    string initErr;
+                    if (!nextRec.initApi(curCfg, initErr)) {
+                        uiLog("[ОШИБКА] " ~ initErr);
+                        uiSetIdleStatus(false);
+                        return;
+                    }
+                    recognizer = nextRec;
+
                     if (needReload) {
-                        if (ensureModelLoaded(recognizer, true)) {
+                        if (ensureModelLoaded(recognizer, curCfg, true)) {
                             uiSetIdleStatus(true);
                         }
                     } else {
-                        uiLog("[CFG] Выбрана модель: " ~ baseName(msg.modelPath));
+                        auto mName = recognizer.modelPath().length ? baseName(recognizer.modelPath()) : curCfg.sherpaModelType;
+                        uiLog("[CFG] Выбрана модель: " ~ mName);
                         uiSetIdleStatus(false);
                     }
                 },
                 (SetUseGpuMsg msg) {
+                    if (recognizer is null) return;
                     bool wasLoaded = recognizer.isLoaded();
+                    curCfg.useGpu = msg.useGpu;
                     recognizer.setUseGpu(msg.useGpu);
                     if (wasLoaded) {
-                        unloadModelNow(recognizer, format("Переключение режима на %s...", msg.useGpu ? "GPU Vulkan" : "CPU"));
-                        if (ensureModelLoaded(recognizer, true)) {
+                        unloadModelNow(recognizer, format("Переключение режима на %s...", msg.useGpu ? "GPU" : "CPU"));
+                        if (ensureModelLoaded(recognizer, curCfg, true)) {
                             uiSetIdleStatus(true);
                         }
                     } else {
-                        uiLog(format("[CFG] Режим вычислений: %s", msg.useGpu ? "GPU (Vulkan)" : "Только процессор (CPU)"));
+                        uiLog(format("[CFG] Режим вычислений: %s", msg.useGpu ? "GPU" : "Только процессор (CPU)"));
                     }
                 },
                 (SetLangMsg msg) {
+                    if (recognizer is null) return;
+                    curCfg.language = msg.language;
                     recognizer.setLanguage(msg.language);
                     uiLog("[CFG] Язык распознавания: " ~ msg.language);
                 },
                 (WorkerCmd cmd) {
+                    if (cmd != WorkerCmd.shutdown && recognizer is null) return;
                     final switch (cmd) {
                         case WorkerCmd.shutdown:
                             running = false;
                             return;
 
                         case WorkerCmd.loadModel:
-                            if (ensureModelLoaded(recognizer, true)) {
+                            if (ensureModelLoaded(recognizer, curCfg, true)) {
                                 if (!atomicLoad(g_state.recording)) uiSetIdleStatus(true);
                             }
                             return;
 
                         case WorkerCmd.loadModelFromHotkey:
-                            if (ensureModelLoaded(recognizer, true)) {
+                            if (ensureModelLoaded(recognizer, curCfg, true)) {
                                 if (atomicLoad(g_state.recording)) {
                                     uiSetStatus("Идёт запись...");
                                     uiSetVisual(VisualState.recording, "Идёт запись...");
@@ -319,7 +385,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                             double rms = calcRms(samples);
 
                             if (!recognizer.isLoaded()) {
-                                if (!ensureModelLoaded(recognizer, true)) {
+                                if (!ensureModelLoaded(recognizer, curCfg, true)) {
                                     return;
                                 }
                             }
@@ -379,9 +445,29 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
         } catch (Throwable e) {
             uiSetProgress(0, 0);
             uiLog("[ОШИБКА воркера] " ~ e.msg);
-            uiSetIdleStatus(recognizer.isLoaded());
+            uiSetIdleStatus(recognizer !is null && recognizer.isLoaded());
         }
     }
+}
+
+private float[] loadWav16kPcm(string path) {
+    import std.file : read;
+    auto raw = cast(const(ubyte)[]) read(path);
+    size_t pos = 12;
+    while (pos + 8 <= raw.length) {
+        auto id = cast(const(char)[]) raw[pos .. pos + 4];
+        uint chunkSize = *cast(const(uint)*) (raw.ptr + pos + 4);
+        pos += 8;
+        if (id == "data" && pos + chunkSize <= raw.length) {
+            size_t n = chunkSize / 2;
+            auto pcm = cast(const(short)*) (raw.ptr + pos);
+            auto samples = new float[n];
+            foreach (i; 0 .. n) samples[i] = pcm[i] / 32768.0f;
+            return samples;
+        }
+        pos += chunkSize + (chunkSize & 1);
+    }
+    return null;
 }
 
 version (unittest) {
@@ -391,6 +477,13 @@ version (unittest) {
         bool checkOnly = args.canFind("--check");
         bool setupOnly = args.canFind("--setup");
         bool allowDownload = !args.canFind("--no-download");
+        string wavTestPath;
+        foreach (a; args) {
+            if (a.length > 6 && a[0 .. 6] == "--wav=") {
+                wavTestPath = a[6 .. $];
+                checkOnly = true;
+            }
+        }
 
         if (checkOnly || setupOnly) {
             attachParentConsoleIfAny();
@@ -403,8 +496,7 @@ version (unittest) {
 
         auto cfg = loadConfig();
         bool isWhisper = normalizeEngine(cfg.engine) == "whisper";
-        bool needTempConsole = isWhisper && !checkOnly && !setupOnly && allowDownload &&
-            (!exists(resolvePath(cfg.whisperDll)) || !exists(resolvePath(cfg.modelPath)));
+        bool needTempConsole = !checkOnly && !setupOnly && allowDownload && !hasAllStartupAssets(cfg);
         if (needTempConsole) openTempConsole();
 
         bool assetsOk = ensureAssets(cfg, allowDownload);
@@ -413,31 +505,51 @@ version (unittest) {
         if (!assetsOk) {
             auto msg = isWhisper
                 ? "Не хватает зависимостей. Запустите с --setup или положите whisper.dll и модель в bin/."
-                : "Не найдена sherpa-onnx-c-api.dll (проверьте sherpaDll в config.json).";
-            if (checkOnly || setupOnly) writeln(msg);
+                : "Не хватает зависимостей sherpa-onnx / GigaAM. Проверьте интернет или пути в config.json.";
+            if (checkOnly || setupOnly) { writeln(msg); stdout.flush(); }
             else showErrorBox(msg);
             return 1;
         }
         if (setupOnly) {
             writeln("Зависимости готовы.");
+            stdout.flush();
             return 0;
         }
 
         string err;
         SttEngine recognizer = createSttEngine(cfg);
-        if (checkOnly) writefln("Инициализация %s (%s)...", normalizeEngine(cfg.engine), recognizer.modelPath());
         if (!recognizer.initApi(cfg, err)) {
-            if (checkOnly) writeln("Ошибка: ", err);
+            if (checkOnly) { writeln("Ошибка: ", err); stdout.flush(); }
             else showErrorBox(err);
             return 1;
         }
-        scope (exit) recognizer.close();
+        bool startedWorker = false;
+        scope (exit) {
+            if (!startedWorker && recognizer !is null) recognizer.close();
+        }
 
         if (checkOnly) {
-            writeln("Загрузка и прогрев модели...");
+            writefln("Инициализация %s (%s)...", normalizeEngine(cfg.engine), recognizer.modelPath());
+            writeln("Загрузка модели...");
+            stdout.flush();
+            auto t0 = nowMs();
             if (!recognizer.loadModel(err)) {
                 writeln("Ошибка: ", err);
+                stdout.flush();
                 return 1;
+            }
+            writefln("Модель загружена за %s мс | Engine=%s", nowMs() - t0, recognizer.engineVersion());
+            stdout.flush();
+
+            if (wavTestPath.length > 0) {
+                auto samples = loadWav16kPcm(resolvePath(wavTestPath));
+                auto t1 = nowMs();
+                int rc = 0;
+                auto text = recognizer.transcribe(samples, &rc);
+                writefln("WAV %s (%.2fс) | rc=%s | %s мс | Текст: %s",
+                    wavTestPath, cast(double) samples.length / SAMPLE_RATE, rc, nowMs() - t1, text);
+                stdout.flush();
+                return rc == 0 ? 0 : 1;
             }
         }
 
@@ -458,6 +570,7 @@ version (unittest) {
             auto testBuf = capture.stopAndTakeBuffer();
             writefln("Микрофон: %s сэмплов за 500мс, RMS=%.5f", testBuf.length, calcRms(testBuf));
             writeln("Проверка пройдена: движок STT, модель и микрофон инициализированы.");
+            stdout.flush();
             return 0;
         }
 
@@ -468,6 +581,7 @@ version (unittest) {
         atomicStore(g_state.beepEnabled, cfg.beep);
         atomicStore(g_state.livePreview, cfg.livePreview);
         atomicStore(g_state.previewBusy, false);
+        atomicStore(g_state.workerExited, false);
         atomicStore(g_state.unloadTimeoutMin, cfg.unloadTimeoutMin);
         atomicStore(g_state.inputModeCode, encodeInputMode(normalizeInputMode(cfg.inputMode)));
         atomicStore(g_state.lastActivityMs, nowMs());
@@ -475,13 +589,23 @@ version (unittest) {
         auto hotkeyVk = parseHotkeyVk(cfg.hotkey);
         auto hotkeyName = vkToKeyName(hotkeyVk);
         auto mics = listInputDevices();
-        auto modelOpts = buildModelOptions(cfg.modelPath);
+        auto currentModelId = modelOptionId(cfg);
+        auto modelOpts = buildModelOptions(cfg);
         auto langOpts = buildLangOptions(cfg.language);
         bool winAuto = isWindowsAutostartEnabled();
 
         immutable AppConfig immCfg = cfg;
         Tid worker = spawn(&workerLoop, cast(shared(AudioCapture)*) &capture, cast(shared(SttEngine)*) &recognizer, immCfg);
-        scope (exit) worker.send(WorkerCmd.shutdown);
+        startedWorker = true;
+        scope (exit) {
+            worker.send(WorkerCmd.shutdown);
+            import core.thread : Thread;
+            import core.time : msecs;
+            foreach (_; 0 .. 300) {
+                if (atomicLoad(g_state.workerExited)) break;
+                Thread.sleep(10.msecs);
+            }
+        }
 
         auto activeModelName = recognizer.modelPath().length ? baseName(recognizer.modelPath()) : cfg.sherpaModelType;
         string[] initLogs = [
@@ -501,7 +625,7 @@ version (unittest) {
             mics,
             cfg.micDevice,
             modelOpts,
-            cfg.modelPath,
+            currentModelId,
             langOpts,
             cfg.language,
             normalizeInputMode(cfg.inputMode),
@@ -568,10 +692,11 @@ version (unittest) {
                     uiLog("[MIC ОШИБКА] " ~ micErr);
                 }
             },
-            (string newModelPath) {
-                cfg.modelPath = newModelPath;
+            (string newOptId) {
+                applyModelPreset(cfg, newOptId);
                 saveConfig(cfg);
-                worker.send(SwitchModelMsg(newModelPath, atomicLoad(g_state.autoLoadModel)));
+                immutable AppConfig nextCfg = cfg;
+                worker.send(SwitchModelMsg(nextCfg, atomicLoad(g_state.autoLoadModel)));
             },
             (string newLang) {
                 cfg.language = newLang;

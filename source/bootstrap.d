@@ -1,12 +1,12 @@
 module bootstrap;
 
-import config : AppConfig, normalizeEngine, resolvePath;
+import config : AppConfig, modelOptionId, normalizeEngine, resolvePath;
 import std.algorithm.searching : endsWith, startsWith;
 import std.conv : to;
 import std.file : dirEntries, exists, mkdirRecurse, remove, rename, rmdirRecurse, SpanMode;
 import std.path : baseName, buildPath, dirName;
-import std.process : pipeProcess, Redirect, spawnProcess, wait;
-import std.stdio : writeln, writefln;
+import std.process : Config, pipeProcess, Redirect, spawnProcess, wait;
+import std.stdio : stdout, writeln, writefln;
 import std.string : strip;
 
 private enum string VulkanRuntimeUrl =
@@ -14,41 +14,69 @@ private enum string VulkanRuntimeUrl =
 private enum string HfModelBaseUrl =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 
-/// Проверяет наличие DLL и модели для активного движка; для Whisper при отсутствии скачивает автоматически.
+private enum string SherpaRuntimeUrl =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-v2.0.3-win-x64-shared-MD-Release-no-tts-lib.tar.bz2";
+private enum string GigaAmV3PunctUrl =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16.tar.bz2";
+private enum string GigaAmMultiModelUrl =
+    "https://huggingface.co/i2z1/gigaam-multilingual-ctc-onnx-int8/resolve/main/model.int8.onnx";
+private enum string GigaAmMultiTokensUrl =
+    "https://huggingface.co/i2z1/gigaam-multilingual-ctc-onnx-int8/resolve/main/tokens.txt";
+
+bool isSherpaModelReady(const ref AppConfig cfg) {
+    if (cfg.sherpaTokens.length == 0 || !exists(resolvePath(cfg.sherpaTokens))) return false;
+    if (cfg.sherpaCtcModel.length > 0 && cfg.sherpaEncoder.length == 0) {
+        return exists(resolvePath(cfg.sherpaCtcModel));
+    }
+    return cfg.sherpaEncoder.length > 0 && exists(resolvePath(cfg.sherpaEncoder)) &&
+           cfg.sherpaDecoder.length > 0 && exists(resolvePath(cfg.sherpaDecoder)) &&
+           cfg.sherpaJoiner.length > 0 && exists(resolvePath(cfg.sherpaJoiner));
+}
+
+bool hasAllStartupAssets(const ref AppConfig cfg) {
+    if (normalizeEngine(cfg.engine) == "sherpa") {
+        return exists(resolvePath(cfg.sherpaDll)) && isSherpaModelReady(cfg);
+    }
+    return exists(resolvePath(cfg.whisperDll)) && exists(resolvePath(cfg.modelPath));
+}
+
+/// Проверяет наличие DLL и модели для активного движка; при отсутствии скачивает автоматически.
 bool ensureAssets(const ref AppConfig cfg, bool allowDownload) {
     if (normalizeEngine(cfg.engine) == "sherpa") {
         auto dllPath = resolvePath(cfg.sherpaDll);
-        if (!exists(dllPath)) {
-            writefln("Отсутствует библиотека sherpa-onnx: %s", dllPath);
+        bool dllOk = exists(dllPath);
+        bool mdlOk = isSherpaModelReady(cfg);
+        if (dllOk && mdlOk) return true;
+
+        if (!allowDownload) {
+            if (!dllOk) writefln("Отсутствует библиотека sherpa-onnx: %s", dllPath);
+            if (!mdlOk) writeln("Отсутствуют файлы модели sherpa-onnx / GigaAM.");
+            stdout.flush();
             return false;
         }
+
+        if (!dllOk && !downloadSherpaRuntime(dirName(dllPath), null)) return false;
+        if (!mdlOk && !downloadSherpaModel(cfg, null)) return false;
         return true;
     }
 
     auto dllPath = resolvePath(cfg.whisperDll);
     auto modelPath = resolvePath(cfg.modelPath);
-
-    if (exists(dllPath) && exists(modelPath)) {
-        return true;
-    }
+    if (exists(dllPath) && exists(modelPath)) return true;
 
     if (!allowDownload) {
         if (!exists(dllPath)) writefln("Отсутствует библиотека: %s", dllPath);
         if (!exists(modelPath)) writefln("Отсутствует модель: %s", modelPath);
+        stdout.flush();
         return false;
     }
 
-    if (!exists(dllPath)) {
-        if (!downloadVulkanRuntime(dirName(dllPath))) return false;
-    }
-
-    if (!exists(modelPath)) {
-        if (!downloadModel(modelPath, null)) return false;
-    }
+    if (!exists(dllPath) && !downloadVulkanRuntime(dirName(dllPath), null)) return false;
+    if (!exists(modelPath) && !downloadModel(modelPath, null)) return false;
     return true;
 }
 
-bool downloadVulkanRuntime(string targetDir) {
+bool downloadVulkanRuntime(string targetDir, void delegate(int pct) onProgress = null) {
     mkdirRecurse(targetDir);
     auto nupkg = buildPath(targetDir, "_whisper_vulkan.nupkg");
     auto tmpExtract = buildPath(targetDir, "_whisper_extract");
@@ -58,22 +86,22 @@ bool downloadVulkanRuntime(string targetDir) {
         if (exists(tmpExtract)) rmdirRecurse(tmpExtract);
     }
 
-    writeln("Скачивание Vulkan-библиотек whisper.cpp (~35 МБ)...");
-    if (!runTool(["curl.exe", "-fL", "--progress-bar", VulkanRuntimeUrl, "-o", nupkg])) {
-        writeln("Ошибка: не удалось скачать Vulkan-пакет whisper.cpp.");
+    if (onProgress is null) writeln("Скачивание Vulkan-библиотек whisper.cpp (~35 МБ)...");
+    if (!downloadFile(VulkanRuntimeUrl, nupkg, onProgress)) {
+        if (onProgress is null) writeln("Ошибка: не удалось скачать Vulkan-пакет whisper.cpp.");
         return false;
     }
 
     mkdirRecurse(tmpExtract);
-    writeln("Распаковка DLL...");
-    if (!runTool(["tar.exe", "-xf", nupkg, "-C", tmpExtract, "build/win-x64"])) {
-        writeln("Ошибка: не удалось распаковать архив через tar.exe.");
+    if (onProgress is null) writeln("Распаковка DLL...");
+    if (!runTool(["tar.exe", "-xf", nupkg, "-C", tmpExtract, "build/win-x64"], onProgress !is null)) {
+        if (onProgress is null) writeln("Ошибка: не удалось распаковать архив через tar.exe.");
         return false;
     }
 
     auto winDir = buildPath(tmpExtract, "build", "win-x64");
     if (!exists(winDir)) {
-        writeln("Ошибка: в архиве не найдена папка build/win-x64.");
+        if (onProgress is null) writeln("Ошибка: в архиве не найдена папка build/win-x64.");
         return false;
     }
 
@@ -84,8 +112,70 @@ bool downloadVulkanRuntime(string targetDir) {
         rename(entry.name, dst);
         ++count;
     }
-    writefln("Установлено DLL: %s", count);
+    if (onProgress is null) writefln("Установлено DLL: %s", count);
     return count > 0;
+}
+
+bool downloadSherpaRuntime(string targetDir, void delegate(int pct) onProgress = null) {
+    mkdirRecurse(targetDir);
+    auto archive = buildPath(targetDir, "_sherpa_runtime.tar.bz2");
+    scope (exit) {
+        if (exists(archive)) remove(archive);
+    }
+
+    if (onProgress is null) writeln("Скачивание sherpa-onnx Runtime для Windows x64...");
+    if (!downloadFile(SherpaRuntimeUrl, archive, onProgress)) {
+        if (onProgress is null) writeln("Ошибка: не удалось скачать sherpa-onnx-c-api.dll.");
+        return false;
+    }
+
+    enum string prefix = "sherpa-onnx-v2.0.3-win-x64-shared-MD-Release-no-tts-lib/lib/";
+    if (onProgress is null) writeln("Распаковка sherpa-onnx DLL...");
+    return runTool([
+        "tar.exe", "-xjf", archive, "-C", targetDir, "--strip-components=2",
+        prefix ~ "onnxruntime.dll",
+        prefix ~ "onnxruntime_providers_shared.dll",
+        prefix ~ "sherpa-onnx-c-api.dll",
+    ], onProgress !is null);
+}
+
+bool downloadSherpaModel(const ref AppConfig cfg, void delegate(int pct) onProgress = null) {
+    auto id = modelOptionId(cfg);
+    if (id == "sherpa:gigaam-v3-punct") {
+        auto encAbs = resolvePath(cfg.sherpaEncoder);
+        auto modelsRoot = dirName(dirName(encAbs));
+        mkdirRecurse(modelsRoot);
+        auto archive = buildPath(modelsRoot, "_gigaam_v3_punct.tar.bz2");
+        scope (exit) {
+            if (exists(archive)) remove(archive);
+        }
+
+        if (onProgress is null) writeln("Скачивание GigaAM v3 RNN-T Punct (~162 МБ)...");
+        if (!downloadFile(GigaAmV3PunctUrl, archive, onProgress)) {
+            if (onProgress is null) writeln("Ошибка: не удалось скачать GigaAM v3.");
+            return false;
+        }
+        if (onProgress is null) writeln("Распаковка GigaAM v3...");
+        return runTool(["tar.exe", "-xjf", archive, "-C", modelsRoot], onProgress !is null);
+    }
+
+    if (id == "sherpa:gigaam-multilingual") {
+        auto modelAbs = resolvePath(cfg.sherpaCtcModel);
+        auto tokensAbs = resolvePath(cfg.sherpaTokens);
+        mkdirRecurse(dirName(modelAbs));
+
+        if (!exists(tokensAbs)) {
+            if (!downloadFile(GigaAmMultiTokensUrl, tokensAbs, null)) return false;
+        }
+        if (!exists(modelAbs)) {
+            if (onProgress is null) writeln("Скачивание GigaAM Multilingual CTC int8 (~215 МБ)...");
+            if (!downloadFile(GigaAmMultiModelUrl, modelAbs, onProgress)) return false;
+        }
+        return true;
+    }
+
+    if (onProgress is null) writeln("Пользовательская sherpa-модель не найдена (автоскачивание не поддерживается).");
+    return false;
 }
 
 bool downloadModel(string modelPath, void delegate(int pct) onProgress = null) {
@@ -97,31 +187,29 @@ bool downloadModel(string modelPath, void delegate(int pct) onProgress = null) {
         return false;
     }
 
-    mkdirRecurse(dirName(modelPath));
-    auto partPath = modelPath ~ ".part";
+    if (onProgress is null) writefln("Скачивание модели %s...", fileName);
+    bool ok = downloadFile(HfModelBaseUrl ~ fileName, modelPath, onProgress);
+    if (!ok && onProgress is null) {
+        writeln("Ошибка: не удалось скачать модель с HuggingFace.");
+    } else if (ok && onProgress is null) {
+        writeln("Модель сохранена.");
+    }
+    return ok;
+}
+
+private bool downloadFile(string url, string dstPath, void delegate(int pct) onProgress) {
+    mkdirRecurse(dirName(dstPath));
+    auto partPath = dstPath ~ ".part";
     scope (exit) {
         if (exists(partPath)) remove(partPath);
     }
 
-    auto url = HfModelBaseUrl ~ fileName;
     string[] cmd = ["curl.exe", "-fL", "--progress-bar", url, "-o", partPath];
+    bool ok = (onProgress is null) ? runTool(cmd) : runCurlWithProgress(cmd, onProgress);
+    if (!ok) return false;
 
-    bool ok;
-    if (onProgress is null) {
-        writefln("Скачивание модели %s...", fileName);
-        ok = runTool(cmd);
-    } else {
-        ok = runCurlWithProgress(cmd, onProgress);
-    }
-
-    if (!ok) {
-        if (onProgress is null) writeln("Ошибка: не удалось скачать модель с HuggingFace.");
-        return false;
-    }
-
-    if (exists(modelPath)) remove(modelPath);
-    rename(partPath, modelPath);
-    if (onProgress is null) writeln("Модель сохранена.");
+    if (exists(dstPath)) remove(dstPath);
+    rename(partPath, dstPath);
     return true;
 }
 
@@ -151,7 +239,7 @@ int parseCurlPercent(string line) {
 }
 
 private bool runCurlWithProgress(string[] cmd, void delegate(int) onProgress) {
-    auto pipes = pipeProcess(cmd, Redirect.stderrToStdout | Redirect.stdin);
+    auto pipes = pipeProcess(cmd, Redirect.stderrToStdout | Redirect.stdin, null, Config.suppressConsole);
     pipes.stdin.close();
 
     int lastPct = -1;
@@ -185,8 +273,8 @@ private bool runCurlWithProgress(string[] cmd, void delegate(int) onProgress) {
     return wait(pipes.pid) == 0;
 }
 
-private bool runTool(string[] args) {
-    auto pid = spawnProcess(args);
+private bool runTool(string[] args, bool silent = false) {
+    auto pid = spawnProcess(args, null, silent ? Config.suppressConsole : Config.none);
     return wait(pid) == 0;
 }
 

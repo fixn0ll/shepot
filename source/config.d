@@ -46,6 +46,72 @@ string normalizeEngine(string engine) {
     return "whisper";
 }
 
+struct ModelPresetInfo {
+    string id;
+    string label;
+}
+
+static immutable ModelPresetInfo[] builtinModelPresets = [
+    ModelPresetInfo("sherpa:gigaam-v3-punct", "GigaAM v3 RNN-T Punct (RU + пунктуация, CPU)"),
+    ModelPresetInfo("sherpa:gigaam-multilingual", "GigaAM Multilingual CTC (RU + EN, CPU)"),
+    ModelPresetInfo("whisper:models/ggml-tiny.bin", "Whisper tiny (~75 МБ, сверхбыстрая)"),
+    ModelPresetInfo("whisper:models/ggml-base.bin", "Whisper base (~142 МБ, быстрая)"),
+    ModelPresetInfo("whisper:models/ggml-small-q5_1.bin", "Whisper small-q5_1 (~182 МБ, лёгкая для CPU)"),
+    ModelPresetInfo("whisper:models/ggml-medium-q5_0.bin", "Whisper medium-q5_0 (~515 МБ, баланс)"),
+    ModelPresetInfo("whisper:models/ggml-large-v3-turbo-q5_0.bin", "Whisper large-v3-turbo-q5_0 (~547 МБ, GPU)"),
+    ModelPresetInfo("whisper:models/ggml-large-v3-turbo-q8_0.bin", "Whisper large-v3-turbo-q8_0 (~834 МБ, макс.)"),
+];
+
+private enum string GigaV3Dir = "models/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16";
+private enum string GigaMultiDir = "models/gigaam-multilingual-ctc-int8";
+
+/// Возвращает идентификатор выбранного пресета модели для UI.
+string modelOptionId(const ref AppConfig cfg) {
+    if (normalizeEngine(cfg.engine) == "sherpa") {
+        if (cfg.sherpaEncoder == GigaV3Dir ~ "/encoder.int8.onnx") return "sherpa:gigaam-v3-punct";
+        if (cfg.sherpaCtcModel == GigaMultiDir ~ "/model.int8.onnx") return "sherpa:gigaam-multilingual";
+        return "sherpa:custom";
+    }
+    return "whisper:" ~ cfg.modelPath;
+}
+
+/// Применяет пресет модели из UI к AppConfig (обновляет engine и пути к файлам).
+void applyModelPreset(ref AppConfig cfg, string optId) {
+    if (optId == "sherpa:gigaam-v3-punct") {
+        cfg.engine = "sherpa";
+        if (cfg.sherpaDll.length == 0) cfg.sherpaDll = "sherpa-onnx-c-api.dll";
+        cfg.sherpaModelType = "nemo_transducer";
+        cfg.sherpaEncoder = GigaV3Dir ~ "/encoder.int8.onnx";
+        cfg.sherpaDecoder = GigaV3Dir ~ "/decoder.onnx";
+        cfg.sherpaJoiner = GigaV3Dir ~ "/joiner.onnx";
+        cfg.sherpaCtcModel = "";
+        cfg.sherpaTokens = GigaV3Dir ~ "/tokens.txt";
+        return;
+    }
+    if (optId == "sherpa:gigaam-multilingual") {
+        cfg.engine = "sherpa";
+        if (cfg.sherpaDll.length == 0) cfg.sherpaDll = "sherpa-onnx-c-api.dll";
+        cfg.sherpaModelType = "nemo_ctc";
+        cfg.sherpaEncoder = "";
+        cfg.sherpaDecoder = "";
+        cfg.sherpaJoiner = "";
+        cfg.sherpaCtcModel = GigaMultiDir ~ "/model.int8.onnx";
+        cfg.sherpaTokens = GigaMultiDir ~ "/tokens.txt";
+        return;
+    }
+    if (optId == "sherpa:custom") {
+        cfg.engine = "sherpa";
+        return;
+    }
+    if (optId.length > 8 && optId[0 .. 8] == "whisper:") {
+        cfg.engine = "whisper";
+        cfg.modelPath = optId[8 .. $];
+        return;
+    }
+    cfg.engine = "whisper";
+    cfg.modelPath = optId;
+}
+
 string normalizeInputMode(string mode) {
     import std.string : toLower;
     auto m = mode.strip().toLower();
@@ -310,4 +376,18 @@ unittest {
     auto shRt = parseConfigJson(serializeConfigJson(sh));
     assert(shRt.engine == "sherpa" && shRt.sherpaModelType == "nemo_ctc");
     assert(shRt.sherpaCtcModel == "models/gigaam.onnx");
+    assert(modelOptionId(shRt) == "sherpa:custom");
+
+    AppConfig sw;
+    applyModelPreset(sw, "sherpa:gigaam-v3-punct");
+    assert(sw.engine == "sherpa" && sw.sherpaModelType == "nemo_transducer");
+    assert(modelOptionId(sw) == "sherpa:gigaam-v3-punct");
+
+    applyModelPreset(sw, "sherpa:gigaam-multilingual");
+    assert(sw.engine == "sherpa" && sw.sherpaModelType == "nemo_ctc");
+    assert(modelOptionId(sw) == "sherpa:gigaam-multilingual");
+
+    applyModelPreset(sw, "whisper:models/ggml-base.bin");
+    assert(sw.engine == "whisper" && sw.modelPath == "models/ggml-base.bin");
+    assert(modelOptionId(sw) == "whisper:models/ggml-base.bin");
 }
