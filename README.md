@@ -1,37 +1,43 @@
+> [!CAUTION]
+> $$\color{red}\text{Disclaimer: This project was vibe-coded for the developer's personal purposes.}$$
+
+🌐 **Language:** **English** | [Русский](README.ru.md)
+
 # Shepot
 
-Нативная Push-to-Talk диктовка для Windows на языке **D (LDC2)** + **Win32 API** с поддержкой двух движков распознавания: **whisper.cpp** (Vulkan GPU / CPU) и **sherpa-onnx** (GigaAM v3 / Multilingual, SenseVoice, Paraformer, Zipformer, Whisper ONNX и др.).
+Native Push-to-Talk voice dictation tool for Windows written in **D (LDC2)** + **Win32 API**, supporting two speech-to-text engines: **whisper.cpp** (Vulkan GPU / CPU) and **sherpa-onnx** (GigaAM v3 / Multilingual, SenseVoice, Paraformer, Zipformer, Whisper ONNX, etc.).
 
-## Возможности
-- **Двухстраничный интерфейс + темы оформления:**
-  - На странице **«Главная»** — статус, кнопка загрузки/выгрузки модели, выбор модели + **«Обзор...»**, просторный журнал работы с кнопками **«Копировать фразу»** и **«Очистить»**.
-  - На странице **«Настройки»** — микрофон, язык, клавиша активации, автовыгрузка, режим ввода, тема оформления (**Авто / Светлая / Тёмная** с мгновенной реакцией на смену темы Windows), чекбоксы и быстрые кнопки открытия **`replacements.json`** и **папки моделей**.
-- **Без тяжёлых рантеймов:** нативный Win32 GUI + системный трей (без Electron, WebView2, Python или .NET), защита от повторного запуска (`Single Instance`).
-- **Два движка распознавания и встроенные пресеты:**
-  - **Whisper (`whisper.cpp`):** `tiny`, `base`, `small-q5_1`, `medium-q5_0`, `large-v3-turbo-q5_0`, `large-v3-turbo-q8_0` с ускорением на **Vulkan GPU** (AMD / NVIDIA / Intel) и переключением на CPU.
-  - **GigaAM (`sherpa-onnx`):** **GigaAM v3 RNN-T Punct** (русский с пунктуацией) и **GigaAM Multilingual CTC** (RU + EN) для сверхбыстрого распознавания на CPU.
-- **Пользовательские модели прямо из UI:** кнопка **«Обзор...»** в окне (и пункт *«Выбрать свою модель...»* в меню трея) открывает диалог выбора файла `.bin` (Whisper GGML) или `.onnx` / `tokens.txt` (`sherpa-onnx` с автоопределением архитектуры папки). Поддерживаются:
+## Features
+- **Multilingual UI (`English` / `Русский`):** English is the primary language (`"uiLanguage": "en"` in `config.json`), with live runtime switching to Russian (and back) in Settings or the tray menu.
+- **Two-page native UI & adaptive themes:**
+  - **Main page** — live status, Load/Unload model button + progress bar, model preset selector with **Browse...** and hover/list recommendations, and an activity log with **Copy Last Phrase** and **Clear** buttons.
+  - **Settings page** — microphone selector, speech language, hotkey binder, auto-unload timeout, input mode, color theme (**Auto / Light / Dark** with live Windows theme tracking), UI language, checkboxes, tooltips on hover, and quick buttons to open **`replacements.json`** and the **`models/`** folder.
+- **Lightweight native runtime:** pure Win32 GUI + system tray icon (no Electron, WebView2, Python, or .NET), single-instance guard (`Single Instance`), and on-demand microphone capture (opens the Windows audio input stream **only during active recording**, so the Windows microphone indicator stays off while idle).
+- **Two STT engines & built-in presets:**
+  - **Whisper (`whisper.cpp`):** `tiny`, `base`, `small-q5_1`, `medium-q5_0`, `large-v3-turbo-q5_0`, `large-v3-turbo-q8_0` with **Vulkan GPU** acceleration (AMD / NVIDIA / Intel) and CPU fallback.
+  - **GigaAM (`sherpa-onnx`):** **GigaAM v3 RNN-T Punct** (Russian with punctuation) and **GigaAM Multilingual CTC** (RU + EN) for ultra-fast CPU inference.
+- **Custom local models right from the UI:** **Browse...** in the main window (or *Browse custom model...* in the tray menu) lets you pick a Whisper GGML `.bin` file or an `.onnx` / `tokens.txt` file inside a `sherpa-onnx` folder with automatic architecture detection:
   - Whisper GGML (`*.bin`);
   - `nemo_transducer` / `transducer` (GigaAM v2/v3 RNN-T, Parakeet, Zipformer);
   - `nemo_ctc` / `gigaam_ctc`, `paraformer`, `sense_voice`, `dolphin`, `zipformer_ctc`, `wenet_ctc`, `telespeech_ctc`;
   - `whisper` (ONNX), `fire_red_asr`, `canary`.
-- **Автоустановка зависимостей:** при выборе встроенного пресета или запуске с `--setup` приложение само скачивает нужные DLL (`whisper.dll` Vulkan или `sherpa-onnx-c-api.dll` + `onnxruntime.dll`) и файлы модели.
-- **Надёжный ввод текста (включая игры):**
-  - **Посимвольно (`sendinput`):** ввод через `KEYEVENTF_UNICODE` с настраиваемой задержкой `charDelayMs` и `VK_RETURN` для переносов строки — работает в играх и окнах, игнорирующих `Ctrl+V`.
-  - **Буфер обмена (`clipboard`):** быстрая вставка через `Ctrl+V` с защитой содержимого — если в буфере сейчас не текст (например, **картинка/скриншот или файлы**), по умолчанию Shepot не затирает буфер, пишет предупреждение в журнал и автоматически вставляет текст **посимвольно**. Включите галочку **«Заменять нетекстовый буфер»** (`overwriteNonTextClipboard`), если нужно всегда вставлять через `Ctrl+V`, перезаписывая картинки/файлы в буфере.
-  - **Авто (`auto`):** короткие фразы (`<= 80` символов) печатает посимвольно, длинные — через буфер обмена.
-- **Гибкое управление записью:**
-  - **Push-to-Talk** или **режим переключения (Toggle)** (нажал — говоришь — нажал);
-  - глобальные хуки клавиатуры и мыши (`MOUSE3`–`MOUSE5`, `F1`–`F12`, `CAPSLOCK`, `SPACE` и др.) с блокировкой проброса клавиши (`blockHotkey`);
-  - **отмена записи по `Esc`** без распознавания;
-  - **копирование последней фразы** из меню трея.
-- **Качество и постобработка текста:**
-  - поддержка `initialPrompt` в `config.json` для подсказок терминов в Whisper;
-  - опциональный словарь автозамен `bin/replacements.json` (например, `{"вишпер": "Whisper", "новая строка": "\n"}`).
-- **Умное управление памятью (VRAM/RAM):** автовыгрузка модели при простое (`1`–`30` мин / `Никогда`), мгновенный старт записи в RAM с параллельной подгрузкой модели, плавающий HUD-индикатор с Live-предпросмотром.
+- **Automatic dependency setup:** selecting a built-in preset or running `--setup` automatically downloads the required runtime DLLs (`whisper.dll` Vulkan or `sherpa-onnx-c-api.dll` + `onnxruntime.dll`) and model weights with in-UI progress reporting.
+- **Reliable text injection (including games):**
+  - **Per-character (`sendinput`):** Unicode injection via `KEYEVENTF_UNICODE` with configurable `charDelayMs` and `VK_RETURN` newlines — works in games and apps that ignore `Ctrl+V`.
+  - **Clipboard (`clipboard`):** fast `Ctrl+V` paste with non-text protection — if the clipboard currently holds non-text data (such as an **image/screenshot or files**), Shepot skips overwriting it by default, logs a warning, and automatically falls back to **per-character** typing. Enable **Overwrite non-text clipboard** (`overwriteNonTextClipboard`) to always paste via `Ctrl+V`.
+  - **Auto (`auto`):** types short phrases (`<= 80` characters) per-character and longer ones via the clipboard.
+- **Flexible recording control:**
+  - **Push-to-Talk** or **Toggle mode** (press to start, press again to stop);
+  - global keyboard and mouse hooks (`MOUSE3`–`MOUSE5`, `F1`–`F12`, `CAPSLOCK`, `SPACE`, etc.) with optional key blocking (`blockHotkey`);
+  - **cancel active recording with `Esc`** without transcribing;
+  - **copy last phrase** from the window or tray menu.
+- **Post-processing & context:**
+  - `initialPrompt` support in `config.json` to hint domain terms to Whisper;
+  - optional replacement dictionary `bin/replacements.json` (e.g. `{"teh": "the", "new line": "\n"}`).
+- **Smart memory management (VRAM/RAM):** idle auto-unload timer (`1`–`30` min / `Never`), instant recording into RAM while the model loads asynchronously in parallel, and a floating HUD status pill with optional live preview.
 
-## Сборка из исходников (Windows x64)
-Требуется **LDC2** (с `dub`) и линковщик **MSVC** (Visual Studio Build Tools; `rc.exe` не нужен — ресурс `assets/app.res` уже предсобран):
+## Build from Source (Windows x64)
+Requires **LDC2** (with `dub`) and the **MSVC** linker (Visual Studio Build Tools; `rc.exe` is not required since `assets/app.res` is prebuilt):
 
 ```powershell
 dub test --compiler=ldc2
@@ -39,22 +45,23 @@ dub build --compiler=ldc2 --build=release
 .\bin\shepot.exe
 ```
 
-При первом запуске недостающие DLL и выбранная модель скачаются автоматически (либо можно заранее вызвать `.\bin\shepot.exe --setup`).
+On first run, missing runtime DLLs and the selected preset model are downloaded automatically (or pre-install them via `.\bin\shepot.exe --setup`).
 
-## Флаги командной строки
-- `--setup` — проверить/скачать runtime DLL и выбранную модель, затем выйти.
-- `--check` — проверить загрузку модели, прогрев и захват микрофона, затем выйти.
-- `--no-download` — запретить автоматическое скачивание недостающих файлов.
-- `--wav=<путь>` — прогнать WAV-файл (16 kHz mono PCM) через текущую модель из `config.json` и вывести результат/тайминги в консоль.
+## CLI Flags
+- `--setup` — verify/download runtime DLLs and the configured model, then exit.
+- `--check` — load the model, run warmup, test microphone capture, then exit.
+- `--no-download` — disable automatic downloading of missing files.
+- `--wav=<path>` — transcribe a 16 kHz mono PCM WAV file using the active `config.json` model and print timing/text to stdout.
 
-## Структура проекта
-- `source/app.d` — координация потоков, фабрика `createSttEngine`, таймаут выгрузки, live-предпросмотр.
-- `source/stt_engine.d` — общий интерфейс `SttEngine`, константа `SAMPLE_RATE = 16000`, фильтры тишины и галлюцинаций.
-- `source/stt.d` / `source/whisper_c.d` — движок `whisper.cpp`, `initial_prompt`, мгновенное прерывание preview.
-- `source/stt_sherpa.d` / `source/sherpa_c.d` — динамическая загрузка `sherpa-onnx-c-api.dll` и поддержка ONNX-моделей.
-- `source/audio.d` — захват микрофона (16 кГц, моно, `f32`) через `winmm` без GC-аллокаций в коллбэке.
-- `source/os_win.d` — Win32 GUI, диалог выбора модели, трей, глобальные хуки, HUD-оверлей, посимвольный ввод / буфер обмена, `Single Instance`.
-- `source/postprocess.d` — загрузка и применение словаря замен `replacements.json`.
-- `source/sound.d` — генерация мягких WAV-сигналов в памяти.
-- `source/bootstrap.d` — автозагрузка Whisper Vulkan / sherpa-onnx DLL и моделей через `curl.exe` и `tar.exe`.
-- `source/config.d` — чтение/сохранение `bin/config.json`, пресеты и автоопределение пользовательских моделей.
+## Project Structure
+- `source/app.d` — worker thread coordination, `createSttEngine` factory, idle unload timer, live preview.
+- `source/i18n.d` — lightweight lock-free English (`en`) / Russian (`ru`) localization helpers.
+- `source/stt_engine.d` — common `SttEngine` interface, `SAMPLE_RATE = 16000`, silence and hallucination filters.
+- `source/stt.d` / `source/whisper_c.d` — `whisper.cpp` backend, `initial_prompt`, instant preview abort.
+- `source/stt_sherpa.d` / `source/sherpa_c.d` — dynamic `sherpa-onnx-c-api.dll` loader and ONNX model support.
+- `source/audio.d` — on-demand WinMM microphone capture (16 kHz mono `f32`, zero GC allocations in callback).
+- `source/os_win.d` — Win32 GUI, dark/light themes, tooltips, custom model dialog, tray menu, global hooks, HUD overlay, Unicode / clipboard input, `Single Instance`.
+- `source/postprocess.d` — `replacements.json` loader and text replacement rules.
+- `source/sound.d` — in-memory soft WAV cue synthesizer.
+- `source/bootstrap.d` — automatic downloader for Whisper Vulkan / sherpa-onnx DLLs and models via `curl.exe` & `tar.exe`.
+- `source/config.d` — `bin/config.json` reader/writer, model presets with hints, custom model folder auto-detection.

@@ -1,6 +1,7 @@
 module stt;
 
 import config : AppConfig, resolvePath;
+import i18n : tr;
 import std.array : appender;
 import std.file : exists;
 import std.string : fromStringz, strip, toStringz;
@@ -84,7 +85,7 @@ class WhisperRecognizer : SttEngine {
     override bool loadModel(out string err) {
         if (m_ctx !is null) return true;
         if (!exists(m_modelPath)) {
-            err = "Модель не найдена: " ~ m_modelPath;
+            err = tr("Model not found: ", "Модель не найдена: ") ~ m_modelPath;
             return false;
         }
 
@@ -97,7 +98,7 @@ class WhisperRecognizer : SttEngine {
 
         m_ctx = m_api.initFromFileWithParams(m_modelPath.toStringz(), cparams);
         if (m_ctx is null) {
-            err = "Не удалось загрузить модель Whisper: " ~ m_modelPath;
+            err = tr("Failed to load Whisper model: ", "Не удалось загрузить модель Whisper: ") ~ m_modelPath;
             return false;
         }
 

@@ -1,6 +1,7 @@
 module stt_sherpa;
 
 import config : AppConfig, resolvePath;
+import i18n : tr;
 import sherpa_c;
 import std.file : exists;
 import std.path : buildPath, dirName;
@@ -83,13 +84,13 @@ class SherpaRecognizer : SttEngine {
         if (m_recognizer !is null) return true;
 
         if (m_tokens.length == 0 || !exists(m_tokens)) {
-            err = "Не найден файл токенов sherpa-onnx: " ~ m_tokens;
+            err = tr("sherpa-onnx tokens file not found: ", "Не найден файл токенов sherpa-onnx: ") ~ m_tokens;
             return false;
         }
 
         if (isCtcMode()) {
             if (m_ctcModel.length == 0 || !exists(m_ctcModel)) {
-                err = "Не найден ONNX-файл модели: " ~ m_ctcModel;
+                err = tr("ONNX model file not found: ", "Не найден ONNX-файл модели: ") ~ m_ctcModel;
                 return false;
             }
         } else {
@@ -98,7 +99,7 @@ class SherpaRecognizer : SttEngine {
                 : [[m_encoder, "encoder"], [m_decoder, "decoder"], [m_joiner, "joiner"]];
             foreach (pair; required) {
                 if (pair[0].length == 0 || !exists(pair[0])) {
-                    err = "Не найден файл sherpa " ~ pair[1] ~ ": " ~ pair[0];
+                    err = tr("sherpa ", "Не найден файл sherpa ") ~ pair[1] ~ tr(" file not found: ", ": ") ~ pair[0];
                     return false;
                 }
             }
@@ -114,7 +115,10 @@ class SherpaRecognizer : SttEngine {
 
         m_recognizer = tryCreateRecognizer("cpu");
         if (m_recognizer is null) {
-            err = "SherpaOnnxCreateOfflineRecognizer вернул NULL (проверьте sherpaModelType и файлы модели)";
+            err = tr(
+                "SherpaOnnxCreateOfflineRecognizer returned NULL (check sherpaModelType and model files)",
+                "SherpaOnnxCreateOfflineRecognizer вернул NULL (проверьте sherpaModelType и файлы модели)"
+            );
             return false;
         }
         m_activeProvider = "cpu";

@@ -1,5 +1,6 @@
 module config;
 
+import i18n : normalizeUiLanguage, tr;
 import std.algorithm.searching : canFind, endsWith;
 import std.conv : to;
 import std.file : dirEntries, exists, isDir, readText, SpanMode, thisExePath, write;
@@ -36,6 +37,7 @@ struct AppConfig {
     int charDelayMs = 3;
     int clipboardRestoreDelayMs = 120;
     bool overwriteNonTextClipboard = false;
+    string uiLanguage = "en";
     string theme = "auto";
     bool beep = true;
     bool showOverlay = true;
@@ -53,48 +55,66 @@ string normalizeEngine(string engine) {
 struct ModelPresetInfo {
     string id;
     string label;
+    string labelRu;
     string hint;
+    string hintRu;
 }
 
 static immutable ModelPresetInfo[] builtinModelPresets = [
     ModelPresetInfo(
         "sherpa:gigaam-v3-punct",
+        "GigaAM v3 RNN-T Punct (RU + punctuation, CPU)",
         "GigaAM v3 RNN-T Punct (RU + пунктуация, CPU)",
+        "Best choice for Russian on CPU: fast, accurate, adds punctuation automatically. Does not use GPU.",
         "Лучший выбор для русского языка на CPU: быстрая, точная, сама расставляет знаки препинания. Видеокарту не использует."
     ),
     ModelPresetInfo(
         "sherpa:gigaam-multilingual",
         "GigaAM Multilingual CTC (RU + EN, CPU)",
+        "GigaAM Multilingual CTC (RU + EN, CPU)",
+        "For mixed speech (Russian + English terms) on CPU without punctuation. Great for coding and quick notes.",
         "Для смешанной речи (русский + английские термины) на CPU без пунктуации. Хороша для программирования и заметок."
     ),
     ModelPresetInfo(
         "whisper:models/ggml-tiny.bin",
+        "Whisper tiny (~75 MB, ultra-fast)",
         "Whisper tiny (~75 МБ, сверхбыстрая)",
+        "Ultra-lightweight model for low-end PCs and quick tests without a GPU: minimal accuracy, instant CPU inference.",
         "Сверхлёгкая модель для слабых ПК и тестов без видеокарты: минимальная точность, но мгновенная работа на CPU."
     ),
     ModelPresetInfo(
         "whisper:models/ggml-base.bin",
+        "Whisper base (~142 MB, fast)",
         "Whisper base (~142 МБ, быстрая)",
+        "Basic lightweight model for simple phrases on laptops and CPUs; less accurate with complex terminology.",
         "Базовая лёгкая модель для простых фраз на ноутбуках и CPU; сложные термины распознаёт хуже старших версий."
     ),
     ModelPresetInfo(
         "whisper:models/ggml-small-q5_1.bin",
+        "Whisper small-q5_1 (~182 MB, light CPU/GPU)",
         "Whisper small-q5_1 (~182 МБ, лёгкая для CPU)",
+        "Good option for entry GPUs or CPUs: noticeably more accurate than tiny/base with modest memory usage.",
         "Хороший вариант для слабого GPU или CPU: заметно точнее tiny/base при умеренном расходе памяти."
     ),
     ModelPresetInfo(
         "whisper:models/ggml-medium-q5_0.bin",
+        "Whisper medium-q5_0 (~515 MB, balanced)",
         "Whisper medium-q5_0 (~515 МБ, баланс)",
+        "Versatile multi-language balance (EN/RU/etc.): fits GPUs with 2+ GB VRAM or strong CPUs.",
         "Универсальный баланс для разных языков (RU/EN и др.): подходит для видеокарты от 2 ГБ VRAM или мощного CPU."
     ),
     ModelPresetInfo(
         "whisper:models/ggml-large-v3-turbo-q5_0.bin",
+        "Whisper large-v3-turbo-q5_0 (~547 MB, GPU)",
         "Whisper large-v3-turbo-q5_0 (~547 МБ, GPU)",
+        "Recommended for Vulkan GPUs: high speed and great quality for English, Russian, and mixed speech.",
         "Рекомендуется для видеокарты (Vulkan GPU): высокая скорость и отличное качество на русском, английском и смешанной речи."
     ),
     ModelPresetInfo(
         "whisper:models/ggml-large-v3-turbo-q8_0.bin",
+        "Whisper large-v3-turbo-q8_0 (~834 MB, max)",
         "Whisper large-v3-turbo-q8_0 (~834 МБ, макс.)",
+        "Highest Whisper accuracy: best for complex dictation, accents, and rare terms on GPUs with 4+ GB VRAM.",
         "Максимальная точность Whisper: для сложной диктовки, акцентов и редких терминов при наличии видеокарты от 4 ГБ VRAM."
     ),
 ];
@@ -102,9 +122,12 @@ static immutable ModelPresetInfo[] builtinModelPresets = [
 /// Возвращает рекомендацию и описание назначения модели по её идентификатору.
 string modelRecommendation(string optId) {
     foreach (p; builtinModelPresets) {
-        if (p.id == optId) return p.hint;
+        if (p.id == optId) return tr(p.hint, p.hintRu);
     }
-    return "Пользовательская локальная модель (выбрана через «Обзор...» или config.json).";
+    return tr(
+        "Custom local model (selected via Browse... or config.json).",
+        "Пользовательская локальная модель (выбрана через «Обзор...» или config.json)."
+    );
 }
 
 private enum string GigaV3Dir = "models/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16";
@@ -191,7 +214,7 @@ private string pickSherpaPart(string[] onnxFiles, string token, string pickedPat
 /// Автоматически определяет движок и пути к файлам модели по выбранному .bin / .onnx / tokens.txt.
 bool detectCustomModelFromFile(string selectedPath, ref AppConfig cfg, out string err) {
     if (selectedPath.length == 0 || !exists(selectedPath)) {
-        err = "Файл не найден: " ~ selectedPath;
+        err = tr("File not found: ", "Файл не найден: ") ~ selectedPath;
         return false;
     }
 
@@ -203,7 +226,10 @@ bool detectCustomModelFromFile(string selectedPath, ref AppConfig cfg, out strin
     }
 
     if (!bn.endsWith(".onnx") && !bn.endsWith("tokens.txt")) {
-        err = "Выберите файл .bin (Whisper) или .onnx / tokens.txt (sherpa-onnx).";
+        err = tr(
+            "Select a .bin (Whisper) or .onnx / tokens.txt (sherpa-onnx) file.",
+            "Выберите файл .bin (Whisper) или .onnx / tokens.txt (sherpa-onnx)."
+        );
         return false;
     }
 
@@ -222,11 +248,11 @@ bool detectCustomModelFromFile(string selectedPath, ref AppConfig cfg, out strin
     }
 
     if (tokensFile.length == 0) {
-        err = "В папке модели не найден файл tokens.txt: " ~ dir;
+        err = tr("tokens.txt not found in model folder: ", "В папке модели не найден файл tokens.txt: ") ~ dir;
         return false;
     }
     if (onnxFiles.length == 0) {
-        err = "В папке не найдены файлы *.onnx: " ~ dir;
+        err = tr("No *.onnx files found in folder: ", "В папке не найдены файлы *.onnx: ") ~ dir;
         return false;
     }
 
@@ -394,6 +420,7 @@ string serializeConfigJson(const ref AppConfig cfg) {
     root["charDelayMs"] = cfg.charDelayMs;
     root["clipboardRestoreDelayMs"] = cfg.clipboardRestoreDelayMs;
     root["overwriteNonTextClipboard"] = cfg.overwriteNonTextClipboard;
+    root["uiLanguage"] = normalizeUiLanguage(cfg.uiLanguage);
     root["theme"] = normalizeTheme(cfg.theme);
     root["beep"] = cfg.beep;
     root["showOverlay"] = cfg.showOverlay;
@@ -469,6 +496,8 @@ AppConfig parseConfigJson(string content) {
     if (cfg.charDelayMs < 0) cfg.charDelayMs = 0;
     integer("clipboardRestoreDelayMs", cfg.clipboardRestoreDelayMs);
     boolean("overwriteNonTextClipboard", cfg.overwriteNonTextClipboard);
+    str("uiLanguage", cfg.uiLanguage);
+    cfg.uiLanguage = normalizeUiLanguage(cfg.uiLanguage);
     str("theme", cfg.theme);
     cfg.theme = normalizeTheme(cfg.theme);
     boolean("beep", cfg.beep);
@@ -527,12 +556,14 @@ unittest {
     assert(cfg.charDelayMs == 5);
     assert(!cfg.overwriteNonTextClipboard);
 
-    auto ov = parseConfigJson(`{"overwriteNonTextClipboard":true,"theme":"DARK"}`);
+    auto ov = parseConfigJson(`{"overwriteNonTextClipboard":true,"theme":"DARK","uiLanguage":"RU"}`);
     assert(ov.overwriteNonTextClipboard);
     assert(ov.theme == "dark");
+    assert(ov.uiLanguage == "ru");
     auto ovRt = parseConfigJson(serializeConfigJson(ov));
-    assert(ovRt.overwriteNonTextClipboard && ovRt.theme == "dark");
+    assert(ovRt.overwriteNonTextClipboard && ovRt.theme == "dark" && ovRt.uiLanguage == "ru");
     assert(normalizeTheme("unknown") == "auto");
+    assert(AppConfig.init.uiLanguage == "en");
 
     auto legacy = parseConfigJson(`{"pasteViaClipboard":true,"charDelayMs":-2}`);
     assert(legacy.inputMode == "clipboard");

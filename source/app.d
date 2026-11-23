@@ -8,11 +8,12 @@ import config : AppConfig, applyModelPreset, builtinModelPresets, detectCustomMo
     normalizeTheme, parseHotkeyVk, resolvePath, saveConfig, vkToKeyName;
 import core.atomic : atomicLoad, atomicStore;
 import core.time : MonoTime;
+import i18n : normalizeUiLanguage, setUiLanguage, tr;
 import os_win : acquireSingleInstance, attachParentConsoleIfAny, closeTempConsole,
     isWindowsAutostartEnabled, openTempConsole, releaseSingleInstance, runTrayApp,
-    setWindowsAutostart, showErrorBox, typeText, uiLog, uiSetGpuAvailable, uiSetIdleStatus,
-    uiSetLastPhrase, uiSetLoadWaiting, uiSetModelOptions, uiSetModelState, uiSetProgress,
-    uiSetStatus, uiSetVisual, UiOption, VisualState;
+    setWindowsAutostart, showErrorBox, typeText, uiLog, uiRefreshLanguage, uiSetGpuAvailable,
+    uiSetIdleStatus, uiSetLangOptions, uiSetLastPhrase, uiSetLoadWaiting, uiSetModelOptions,
+    uiSetModelState, uiSetProgress, uiSetStatus, uiSetVisual, UiOption, VisualState;
 import postprocess : ReplacementStore;
 import sound : playActivationCueAsync, playClickAsync, playCueAsync;
 import std.algorithm.searching : any, canFind;
@@ -101,13 +102,14 @@ private UiOption[] buildModelOptions(const ref AppConfig cfg) {
     UiOption[] opts;
     opts.reserve(builtinModelPresets.length + 1);
     foreach (p; builtinModelPresets) {
-        opts ~= UiOption(p.label, p.id, p.hint);
+        opts ~= UiOption(tr(p.label, p.labelRu), p.id, tr(p.hint, p.hintRu));
     }
     auto curId = modelOptionId(cfg);
     if (!opts.any!(o => o.value == curId)) {
         auto label = normalizeEngine(cfg.engine) == "sherpa"
-            ? ("Sherpa (пользовательская): " ~ baseName(cfg.sherpaEncoder.length ? cfg.sherpaEncoder : cfg.sherpaCtcModel))
-            : (baseName(cfg.modelPath) ~ " (пользовательская)");
+            ? (tr("Sherpa (custom): ", "Sherpa (пользовательская): ")
+                ~ baseName(cfg.sherpaEncoder.length ? cfg.sherpaEncoder : cfg.sherpaCtcModel))
+            : (baseName(cfg.modelPath) ~ tr(" (custom)", " (пользовательская)"));
         opts ~= UiOption(label, curId, modelRecommendation(curId));
     }
     return opts;
@@ -115,16 +117,16 @@ private UiOption[] buildModelOptions(const ref AppConfig cfg) {
 
 private UiOption[] buildLangOptions(string currentLang) {
     UiOption[] opts = [
-        UiOption("Русский (ru)", "ru"),
-        UiOption("Английский (en)", "en"),
-        UiOption("Автоопределение (auto)", "auto"),
-        UiOption("Украинский (uk)", "uk"),
-        UiOption("Немецкий (de)", "de"),
-        UiOption("Французский (fr)", "fr"),
-        UiOption("Испанский (es)", "es"),
-        UiOption("Польский (pl)", "pl"),
-        UiOption("Китайский (zh)", "zh"),
-        UiOption("Японский (ja)", "ja"),
+        UiOption(tr("English (en)", "Английский (en)"), "en"),
+        UiOption(tr("Russian (ru)", "Русский (ru)"), "ru"),
+        UiOption(tr("Auto-detect (auto)", "Автоопределение (auto)"), "auto"),
+        UiOption(tr("Ukrainian (uk)", "Украинский (uk)"), "uk"),
+        UiOption(tr("German (de)", "Немецкий (de)"), "de"),
+        UiOption(tr("French (fr)", "Французский (fr)"), "fr"),
+        UiOption(tr("Spanish (es)", "Испанский (es)"), "es"),
+        UiOption(tr("Polish (pl)", "Польский (pl)"), "pl"),
+        UiOption(tr("Chinese (zh)", "Китайский (zh)"), "zh"),
+        UiOption(tr("Japanese (ja)", "Японский (ja)"), "ja"),
     ];
     if (currentLang.length > 0 && !opts.any!(o => o.value == currentLang)) {
         opts ~= UiOption(currentLang, currentLang);
@@ -143,13 +145,13 @@ private bool ensureRuntimeUi(const ref AppConfig curCfg) {
 
     auto label = isSherpa ? "sherpa-onnx DLL" : "Whisper Vulkan DLL";
     uiSetModelState(false, true);
-    uiSetStatus(format("Скачивание %s: 0%%...", label));
+    uiSetStatus(format(tr("Downloading %s: 0%%...", "Скачивание %s: 0%%..."), label));
     uiSetProgress(2, 0);
-    uiLog("[DL] Начато скачивание " ~ label ~ "...");
+    uiLog(format(tr("[DL] Starting download of %s...", "[DL] Начато скачивание %s..."), label));
 
     auto cb = (int pct) {
         uiSetProgress(2, pct);
-        uiSetStatus(format("Скачивание %s: %s%%...", label, pct));
+        uiSetStatus(format(tr("Downloading %s: %s%%...", "Скачивание %s: %s%%..."), label, pct));
     };
     bool ok = isSherpa
         ? downloadSherpaRuntime(dirName(dllPath), cb)
@@ -157,12 +159,12 @@ private bool ensureRuntimeUi(const ref AppConfig curCfg) {
 
     uiSetProgress(0, 0);
     if (!ok) {
-        uiLog("[DL ОШИБКА] Не удалось скачать " ~ label);
+        uiLog(format(tr("[DL ERROR] Failed to download %s", "[DL ОШИБКА] Не удалось скачать %s"), label));
         uiSetModelState(false, false);
         uiSetIdleStatus(false);
         return false;
     }
-    uiLog("[DL] Установлены библиотеки " ~ label);
+    uiLog(format(tr("[DL] Installed %s", "[DL] Установлены библиотеки %s"), label));
     return true;
 }
 
@@ -174,13 +176,13 @@ private bool ensureModelDownloadedUi(const ref AppConfig curCfg) {
 
     auto name = isSherpa ? modelOptionId(curCfg) : baseName(curCfg.modelPath);
     uiSetModelState(false, true);
-    uiSetStatus(format("Скачивание %s: 0%%...", name));
+    uiSetStatus(format(tr("Downloading %s: 0%%...", "Скачивание %s: 0%%..."), name));
     uiSetProgress(2, 0);
-    uiLog(format("[DL] Начато скачивание модели %s...", name));
+    uiLog(format(tr("[DL] Starting download of model %s...", "[DL] Начато скачивание модели %s..."), name));
 
     auto cb = (int pct) {
         uiSetProgress(2, pct);
-        uiSetStatus(format("Скачивание %s: %s%%...", name, pct));
+        uiSetStatus(format(tr("Downloading %s: %s%%...", "Скачивание %s: %s%%..."), name, pct));
     };
     bool ok = isSherpa
         ? downloadSherpaModel(curCfg, cb)
@@ -188,12 +190,12 @@ private bool ensureModelDownloadedUi(const ref AppConfig curCfg) {
 
     uiSetProgress(0, 0);
     if (!ok) {
-        uiLog("[DL ОШИБКА] Не удалось скачать модель " ~ name);
+        uiLog(format(tr("[DL ERROR] Failed to download model %s", "[DL ОШИБКА] Не удалось скачать модель %s"), name));
         uiSetModelState(false, false);
         uiSetIdleStatus(false);
         return false;
     }
-    uiLog("[DL] Модель " ~ name ~ " скачана.");
+    uiLog(format(tr("[DL] Model %s downloaded.", "[DL] Модель %s скачана."), name));
     return true;
 }
 
@@ -215,7 +217,7 @@ private bool ensureModelLoaded(SttEngine recognizer, const ref AppConfig curCfg,
         return false;
     }
 
-    uiSetStatus(format("Загрузка модели (%s)...", recognizer.useGpu() ? "GPU" : "CPU"));
+    uiSetStatus(format(tr("Loading model (%s)...", "Загрузка модели (%s)..."), recognizer.useGpu() ? "GPU" : "CPU"));
     uiSetProgress(1, 0);
 
     string err;
@@ -227,7 +229,7 @@ private bool ensureModelLoaded(SttEngine recognizer, const ref AppConfig curCfg,
     if (!ok) {
         atomicStore(g_state.modelLoaded, false);
         uiSetModelState(false, false);
-        uiLog("[ОШИБКА] " ~ err);
+        uiLog(tr("[ERROR] ", "[ОШИБКА] ") ~ err);
         uiSetIdleStatus(false);
         return false;
     }
@@ -236,7 +238,8 @@ private bool ensureModelLoaded(SttEngine recognizer, const ref AppConfig curCfg,
     atomicStore(g_state.lastActivityMs, nowMs());
     uiSetModelState(true, false);
     auto mName = recognizer.modelPath().length ? baseName(recognizer.modelPath()) : recognizer.engineVersion();
-    uiLog(format("[MDL] Модель %s загружена (%s).", mName, recognizer.useGpu() ? "GPU" : "CPU"));
+    uiLog(format(tr("[MDL] Model %s loaded (%s).", "[MDL] Модель %s загружена (%s)."),
+        mName, recognizer.useGpu() ? "GPU" : "CPU"));
     if (notifyCue && atomicLoad(g_state.beepEnabled)) {
         playActivationCueAsync();
     }
@@ -276,7 +279,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                 (SwitchModelMsg msg) {
                     bool needReload = (recognizer !is null && recognizer.isLoaded()) || msg.reloadNow;
                     if (recognizer !is null) {
-                        if (recognizer.isLoaded()) unloadModelNow(recognizer, "Смена модели...");
+                        if (recognizer.isLoaded()) unloadModelNow(recognizer, tr("Switching model...", "Смена модели..."));
                         recognizer.close();
                         recognizer = null;
                     }
@@ -292,7 +295,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                     auto nextRec = createSttEngine(curCfg);
                     string initErr;
                     if (!nextRec.initApi(curCfg, initErr)) {
-                        uiLog("[ОШИБКА] " ~ initErr);
+                        uiLog(tr("[ERROR] ", "[ОШИБКА] ") ~ initErr);
                         uiSetIdleStatus(false);
                         return;
                     }
@@ -305,7 +308,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                         }
                     } else {
                         auto mName = recognizer.modelPath().length ? baseName(recognizer.modelPath()) : curCfg.sherpaModelType;
-                        uiLog("[CFG] Выбрана модель: " ~ mName);
+                        uiLog(tr("[CFG] Selected model: ", "[CFG] Выбрана модель: ") ~ mName);
                         uiSetIdleStatus(false);
                     }
                 },
@@ -315,19 +318,20 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                     curCfg.useGpu = msg.useGpu;
                     recognizer.setUseGpu(msg.useGpu);
                     if (wasLoaded) {
-                        unloadModelNow(recognizer, format("Переключение режима на %s...", msg.useGpu ? "GPU" : "CPU"));
+                        unloadModelNow(recognizer, format(tr("Switching compute mode to %s...", "Переключение режима на %s..."), msg.useGpu ? "GPU" : "CPU"));
                         if (ensureModelLoaded(recognizer, curCfg, true)) {
                             uiSetIdleStatus(true);
                         }
                     } else {
-                        uiLog(format("[CFG] Режим вычислений: %s", msg.useGpu ? "GPU" : "Только процессор (CPU)"));
+                        uiLog(format(tr("[CFG] Compute mode: %s", "[CFG] Режим вычислений: %s"),
+                            msg.useGpu ? "GPU" : tr("CPU only", "Только процессор (CPU)")));
                     }
                 },
                 (SetLangMsg msg) {
                     if (recognizer is null) return;
                     curCfg.language = msg.language;
                     recognizer.setLanguage(msg.language);
-                    uiLog("[CFG] Язык распознавания: " ~ msg.language);
+                    uiLog(tr("[CFG] Speech language: ", "[CFG] Язык распознавания: ") ~ msg.language);
                 },
                 (WorkerCmd cmd) {
                     if (cmd != WorkerCmd.shutdown && recognizer is null) return;
@@ -345,8 +349,8 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                         case WorkerCmd.loadModelFromHotkey:
                             if (ensureModelLoaded(recognizer, curCfg, true)) {
                                 if (atomicLoad(g_state.recording)) {
-                                    uiSetStatus("Идёт запись...");
-                                    uiSetVisual(VisualState.recording, "Идёт запись...");
+                                    uiSetStatus(tr("Recording...", "Идёт запись..."));
+                                    uiSetVisual(VisualState.recording, tr("Recording...", "Идёт запись..."));
                                 } else {
                                     uiSetIdleStatus(true);
                                     uiSetVisual(VisualState.idle, "");
@@ -355,7 +359,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                             return;
 
                         case WorkerCmd.unloadModel:
-                            unloadModelNow(recognizer, "Модель выгружена вручную.");
+                            unloadModelNow(recognizer, tr("Model unloaded manually.", "Модель выгружена вручную."));
                             return;
 
                         case WorkerCmd.idleCheck:
@@ -365,7 +369,10 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                             }
                             ulong idleMs = nowMs() - atomicLoad(g_state.lastActivityMs);
                             if (idleMs >= cast(ulong) mins * 60_000UL) {
-                                unloadModelNow(recognizer, format("Модель выгружена по таймауту (%s мин бездействия).", mins));
+                                unloadModelNow(recognizer, format(
+                                    tr("Model unloaded on idle timeout (%s min).", "Модель выгружена по таймауту (%s мин бездействия)."),
+                                    mins
+                                ));
                             }
                             return;
 
@@ -396,15 +403,15 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                             atomicStore(g_state.lastActivityMs, nowMs());
 
                             if (!isSpeechValid(samples, cfg.minDurationSec, cfg.rmsThreshold)) {
-                                uiLog(format("[ПРОПУСК] %.2f сек, RMS=%.5f (порог: %.2f сек / %.5f)",
+                                uiLog(format(tr("[SKIP] %.2fs, RMS=%.5f (threshold: %.2fs / %.5f)", "[ПРОПУСК] %.2f сек, RMS=%.5f (порог: %.2f сек / %.5f)"),
                                     dur, rms, cfg.minDurationSec, cfg.rmsThreshold));
                                 uiSetIdleStatus(true);
-                                uiSetVisual(VisualState.idle, "Тишина / слишком коротко", 800);
+                                uiSetVisual(VisualState.idle, tr("Silence / too short", "Тишина / слишком коротко"), 800);
                                 return;
                             }
 
-                            uiSetStatus("Распознавание...");
-                            uiSetVisual(VisualState.processing, "Обработка голоса...");
+                            uiSetStatus(tr("Transcribing...", "Распознавание..."));
+                            uiSetVisual(VisualState.processing, tr("Processing voice...", "Обработка голоса..."));
                             uiSetProgress(2, 0);
                             int rc = 0;
                             auto text = recognizer.transcribe(samples, &rc, &onWhisperProgress);
@@ -412,22 +419,22 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                             atomicStore(g_state.lastActivityMs, nowMs());
 
                             if (rc != 0) {
-                                uiLog(format("[ОШИБКА] Распознаватель вернул код %s", rc));
+                                uiLog(format(tr("[ERROR] Recognizer returned code %s", "[ОШИБКА] Распознаватель вернул код %s"), rc));
                                 uiSetIdleStatus(true);
-                                uiSetVisual(VisualState.idle, "Ошибка распознавания", 1200);
+                                uiSetVisual(VisualState.idle, tr("Recognition error", "Ошибка распознавания"), 1200);
                                 return;
                             }
                             if (text.length == 0) {
-                                uiLog(format("[ПУСТО] %.2f сек, RMS=%.5f — речь не распознана / отфильтрована", dur, rms));
+                                uiLog(format(tr("[EMPTY] %.2fs, RMS=%.5f — speech not recognized / filtered", "[ПУСТО] %.2f сек, RMS=%.5f — речь не распознана / отфильтрована"), dur, rms));
                                 uiSetIdleStatus(true);
-                                uiSetVisual(VisualState.idle, "Речь не распознана", 900);
+                                uiSetVisual(VisualState.idle, tr("No speech detected", "Речь не распознана"), 900);
                                 return;
                             }
 
                             text = replacements.apply(text);
                             if (text.length == 0) {
                                 uiSetIdleStatus(true);
-                                uiSetVisual(VisualState.idle, "Речь не распознана", 900);
+                                uiSetVisual(VisualState.idle, tr("No speech detected", "Речь не распознана"), 900);
                                 return;
                             }
 
@@ -436,9 +443,9 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                             bool overwriteClip = atomicLoad(g_state.overwriteNonTextClipboard);
                             typeText(text, mode, cfg.charDelayMs, cfg.clipboardRestoreDelayMs, method, overwriteClip);
                             uiSetLastPhrase(text);
-                            uiLog(format("[STT] (%.2fс, RMS=%.4f, %s): %s", dur, rms, method, text));
+                            uiLog(format(tr("[STT] (%.2fs, RMS=%.4f, %s): %s", "[STT] (%.2fс, RMS=%.4f, %s): %s"), dur, rms, method, text));
                             uiSetIdleStatus(true);
-                            uiSetVisual(VisualState.pasted, "Вставлено: " ~ text, 1100);
+                            uiSetVisual(VisualState.pasted, tr("Typed: ", "Вставлено: ") ~ text, 1100);
                             return;
                     }
                 },
@@ -448,7 +455,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
             );
         } catch (Throwable e) {
             uiSetProgress(0, 0);
-            uiLog("[ОШИБКА воркера] " ~ e.msg);
+            uiLog(tr("[WORKER ERROR] ", "[ОШИБКА воркера] ") ~ e.msg);
             uiSetIdleStatus(recognizer !is null && recognizer.isLoaded());
         }
     }
@@ -499,6 +506,7 @@ version (unittest) {
         }
 
         auto cfg = loadConfig();
+        setUiLanguage(cfg.uiLanguage);
         bool isWhisper = normalizeEngine(cfg.engine) == "whisper";
         bool cliMode = checkOnly || setupOnly;
         bool needTempConsole = !cliMode && allowDownload && !hasRuntimeDll(cfg);
@@ -509,14 +517,20 @@ version (unittest) {
 
         if (!assetsOk) {
             auto msg = isWhisper
-                ? "Не хватает зависимостей. Запустите с --setup или положите whisper.dll и модель в bin/."
-                : "Не хватает зависимостей sherpa-onnx / GigaAM. Проверьте интернет или пути в config.json.";
+                ? tr(
+                    "Missing dependencies. Run with --setup or place whisper.dll and a model in bin/.",
+                    "Не хватает зависимостей. Запустите с --setup или положите whisper.dll и модель в bin/."
+                )
+                : tr(
+                    "Missing sherpa-onnx / GigaAM dependencies. Check internet connection or paths in config.json.",
+                    "Не хватает зависимостей sherpa-onnx / GigaAM. Проверьте интернет или пути в config.json."
+                );
             if (checkOnly || setupOnly) { writeln(msg); stdout.flush(); }
             else showErrorBox(msg);
             return 1;
         }
         if (setupOnly) {
-            writeln("Зависимости готовы.");
+            writeln(tr("Dependencies are ready.", "Зависимости готовы."));
             stdout.flush();
             return 0;
         }
@@ -524,7 +538,7 @@ version (unittest) {
         string err;
         SttEngine recognizer = createSttEngine(cfg);
         if (!recognizer.initApi(cfg, err)) {
-            if (checkOnly) { writeln("Ошибка: ", err); stdout.flush(); }
+            if (checkOnly) { writeln(tr("Error: ", "Ошибка: "), err); stdout.flush(); }
             else showErrorBox(err);
             return 1;
         }
@@ -534,16 +548,16 @@ version (unittest) {
         }
 
         if (checkOnly) {
-            writefln("Инициализация %s (%s)...", normalizeEngine(cfg.engine), recognizer.modelPath());
-            writeln("Загрузка модели...");
+            writefln(tr("Initializing %s (%s)...", "Инициализация %s (%s)..."), normalizeEngine(cfg.engine), recognizer.modelPath());
+            writeln(tr("Loading model...", "Загрузка модели..."));
             stdout.flush();
             auto t0 = nowMs();
             if (!recognizer.loadModel(err)) {
-                writeln("Ошибка: ", err);
+                writeln(tr("Error: ", "Ошибка: "), err);
                 stdout.flush();
                 return 1;
             }
-            writefln("Модель загружена за %s мс | Engine=%s", nowMs() - t0, recognizer.engineVersion());
+            writefln(tr("Model loaded in %s ms | Engine=%s", "Модель загружена за %s мс | Engine=%s"), nowMs() - t0, recognizer.engineVersion());
             stdout.flush();
 
             if (wavTestPath.length > 0) {
@@ -551,7 +565,7 @@ version (unittest) {
                 auto t1 = nowMs();
                 int rc = 0;
                 auto text = recognizer.transcribe(samples, &rc);
-                writefln("WAV %s (%.2fс) | rc=%s | %s мс | Текст: %s",
+                writefln(tr("WAV %s (%.2fs) | rc=%s | %s ms | Text: %s", "WAV %s (%.2fс) | rc=%s | %s мс | Текст: %s"),
                     wavTestPath, cast(double) samples.length / SAMPLE_RATE, rc, nowMs() - t1, text);
                 stdout.flush();
                 return rc == 0 ? 0 : 1;
@@ -560,7 +574,7 @@ version (unittest) {
 
         AudioCapture capture;
         if (!capture.init(cfg.micDevice, err)) {
-            if (checkOnly) writeln("Ошибка: ", err);
+            if (checkOnly) writeln(tr("Error: ", "Ошибка: "), err);
             else showErrorBox(err);
             return 1;
         }
@@ -572,14 +586,16 @@ version (unittest) {
             writefln("Engine=%s", recognizer.engineVersion());
             string chkMicErr;
             if (!capture.startRecording(chkMicErr)) {
-                writeln("Ошибка микрофона: ", chkMicErr);
+                writeln(tr("Microphone error: ", "Ошибка микрофона: "), chkMicErr);
                 stdout.flush();
                 return 1;
             }
             Thread.sleep(500.msecs);
             auto testBuf = capture.stopAndTakeBuffer();
-            writefln("Микрофон: %s сэмплов за 500мс, RMS=%.5f", testBuf.length, calcRms(testBuf));
-            writeln("Проверка пройдена: движок STT, модель и микрофон инициализированы.");
+            writefln(tr("Microphone: %s samples in 500ms, RMS=%.5f", "Микрофон: %s сэмплов за 500мс, RMS=%.5f"),
+                testBuf.length, calcRms(testBuf));
+            writeln(tr("Check passed: STT engine, model, and microphone initialized.",
+                "Проверка пройдена: движок STT, модель и микрофон инициализированы."));
             stdout.flush();
             return 0;
         }
@@ -620,12 +636,16 @@ version (unittest) {
 
         auto activeModelName = recognizer.modelPath().length ? baseName(recognizer.modelPath()) : cfg.sherpaModelType;
         string[] initLogs = [
-            format("%s готов (%s, режим: %s)",
+            format(tr("%s ready (%s, mode: %s)", "%s готов (%s, режим: %s)"),
                 recognizer.engineVersion(), activeModelName, recognizer.useGpu() ? "GPU" : "CPU"),
-            format("Активация: [%s], язык: %s, автовыгрузка: %s",
-                hotkeyName, cfg.language, cfg.unloadTimeoutMin > 0 ? format("%s мин", cfg.unloadTimeoutMin) : "Никогда"),
-            format("Найдено микрофонов: %s", mics.length),
-            "Закрытие окна [X] сворачивает программу в трей. Выход — через меню иконки в трее.",
+            format(tr("Activation: [%s], speech lang: %s, auto-unload: %s", "Активация: [%s], язык: %s, автовыгрузка: %s"),
+                hotkeyName, cfg.language,
+                cfg.unloadTimeoutMin > 0
+                    ? format(tr("%s min", "%s мин"), cfg.unloadTimeoutMin)
+                    : tr("Never", "Никогда")),
+            format(tr("Microphones detected: %s", "Найдено микрофонов: %s"), mics.length),
+            tr("Closing [X] minimizes to system tray. Use the tray menu to exit.",
+               "Закрытие окна [X] сворачивает программу в трей. Выход — через меню иконки в трее."),
         ];
 
         bool ok = runTrayApp(
@@ -658,9 +678,9 @@ version (unittest) {
                 string micErr;
                 if (!capture.startRecording(micErr)) {
                     atomicStore(g_state.recording, false);
-                    uiLog("[MIC ОШИБКА] " ~ micErr);
+                    uiLog(tr("[MIC ERROR] ", "[MIC ОШИБКА] ") ~ micErr);
                     uiSetIdleStatus(atomicLoad(g_state.modelLoaded));
-                    uiSetVisual(VisualState.idle, "Ошибка микрофона", 1200);
+                    uiSetVisual(VisualState.idle, tr("Microphone error", "Ошибка микрофона"), 1200);
                     return;
                 }
                 atomicStore(g_state.recording, true);
@@ -668,8 +688,8 @@ version (unittest) {
                 bool beepOn = atomicLoad(g_state.beepEnabled);
 
                 if (!atomicLoad(g_state.modelLoaded)) {
-                    uiSetStatus("Загрузка модели (идёт запись)...");
-                    uiSetVisual(VisualState.recording, "Загрузка модели и запись...");
+                    uiSetStatus(tr("Loading model (recording)...", "Загрузка модели (идёт запись)..."));
+                    uiSetVisual(VisualState.recording, tr("Loading model & recording...", "Загрузка модели и запись..."));
                     if (beepOn) {
                         playClickAsync();
                         uiSetLoadWaiting(true);
@@ -680,8 +700,8 @@ version (unittest) {
                         worker.send(WorkerCmd.loadModelFromHotkey);
                     }
                 } else {
-                    uiSetStatus("Идёт запись...");
-                    uiSetVisual(VisualState.recording, "Идёт запись...");
+                    uiSetStatus(tr("Recording...", "Идёт запись..."));
+                    uiSetVisual(VisualState.recording, tr("Recording...", "Идёт запись..."));
                     if (beepOn) playCueAsync(true);
                 }
             },
@@ -689,7 +709,7 @@ version (unittest) {
                 atomicStore(g_state.recording, false);
                 atomicStore(g_state.lastActivityMs, nowMs());
                 capture.stopStream();
-                uiSetVisual(VisualState.processing, "Обработка голоса...");
+                uiSetVisual(VisualState.processing, tr("Processing voice...", "Обработка голоса..."));
                 if (atomicLoad(g_state.modelLoaded) && atomicLoad(g_state.beepEnabled)) {
                     playCueAsync(false);
                 }
@@ -701,17 +721,17 @@ version (unittest) {
                 capture.stopAndTakeBuffer();
                 if (atomicLoad(g_state.beepEnabled)) playCueAsync(false);
                 uiSetIdleStatus(atomicLoad(g_state.modelLoaded));
-                uiSetVisual(VisualState.idle, "Запись отменена", 1000);
-                uiLog("[REC] Запись отменена (Esc)");
+                uiSetVisual(VisualState.idle, tr("Recording cancelled", "Запись отменена"), 1000);
+                uiLog(tr("[REC] Recording cancelled (Esc)", "[REC] Запись отменена (Esc)"));
             },
             (int newDeviceId) {
                 string micErr;
                 if (capture.reopen(newDeviceId, micErr)) {
                     cfg.micDevice = newDeviceId;
                     saveConfig(cfg);
-                    uiLog(format("[MIC] Переключён микрофон (deviceId=%s)", newDeviceId));
+                    uiLog(format(tr("[MIC] Switched microphone (deviceId=%s)", "[MIC] Переключён микрофон (deviceId=%s)"), newDeviceId));
                 } else {
-                    uiLog("[MIC ОШИБКА] " ~ micErr);
+                    uiLog(tr("[MIC ERROR] ", "[MIC ОШИБКА] ") ~ micErr);
                 }
             },
             (string newOptId) {
@@ -724,14 +744,14 @@ version (unittest) {
                 AppConfig nextCfgMut = cfg;
                 string detErr;
                 if (!detectCustomModelFromFile(pickedPath, nextCfgMut, detErr)) {
-                    uiLog("[ОШИБКА] " ~ detErr);
+                    uiLog(tr("[ERROR] ", "[ОШИБКА] ") ~ detErr);
                     showErrorBox(detErr);
                     return;
                 }
                 cfg = nextCfgMut;
                 saveConfig(cfg);
                 uiSetModelOptions(buildModelOptions(cfg), modelOptionId(cfg));
-                uiLog(format("[CFG] Пользовательская модель (%s/%s): %s",
+                uiLog(format(tr("[CFG] Custom model (%s/%s): %s", "[CFG] Пользовательская модель (%s/%s): %s"),
                     cfg.engine, cfg.engine == "sherpa" ? cfg.sherpaModelType : "ggml", baseName(pickedPath)));
                 immutable AppConfig nextCfg = cfg;
                 worker.send(SwitchModelMsg(nextCfg, atomicLoad(g_state.autoLoadModel)));
@@ -745,7 +765,7 @@ version (unittest) {
                 auto newName = vkToKeyName(newVk);
                 cfg.hotkey = newName;
                 saveConfig(cfg);
-                uiLog(format("[CFG] Новая кнопка активации: [%s]", newName));
+                uiLog(format(tr("[CFG] New activation key: [%s]", "[CFG] Новая кнопка активации: [%s]"), newName));
                 return newName;
             },
             () {
@@ -763,37 +783,51 @@ version (unittest) {
                 atomicStore(g_state.unloadTimeoutMin, mins);
                 atomicStore(g_state.lastActivityMs, nowMs());
                 saveConfig(cfg);
-                uiLog(format("[CFG] Автовыгрузка модели: %s", mins > 0 ? format("%s мин", mins) : "Никогда"));
+                uiLog(format(tr("[CFG] Auto-unload model: %s", "[CFG] Автовыгрузка модели: %s"),
+                    mins > 0 ? format(tr("%s min", "%s мин"), mins) : tr("Never", "Никогда")));
             },
             (string mode) {
                 auto norm = normalizeInputMode(mode);
                 cfg.inputMode = norm;
                 atomicStore(g_state.inputModeCode, encodeInputMode(norm));
                 saveConfig(cfg);
-                uiLog("[CFG] Режим ввода: " ~ norm);
+                uiLog(tr("[CFG] Input mode: ", "[CFG] Режим ввода: ") ~ norm);
             },
             (string newTheme) {
                 auto norm = normalizeTheme(newTheme);
                 cfg.theme = norm;
                 saveConfig(cfg);
-                uiLog("[CFG] Тема оформления: " ~ norm);
+                uiLog(tr("[CFG] Theme: ", "[CFG] Тема оформления: ") ~ norm);
+            },
+            (string newUiLang) {
+                auto norm = normalizeUiLanguage(newUiLang);
+                cfg.uiLanguage = norm;
+                setUiLanguage(norm);
+                saveConfig(cfg);
+                uiSetModelOptions(buildModelOptions(cfg), modelOptionId(cfg));
+                uiSetLangOptions(buildLangOptions(cfg.language), cfg.language);
+                uiRefreshLanguage();
+                uiLog(tr("[CFG] UI language: ", "[CFG] Язык интерфейса: ") ~ norm);
             },
             (bool overwriteOn) {
                 cfg.overwriteNonTextClipboard = overwriteOn;
                 atomicStore(g_state.overwriteNonTextClipboard, overwriteOn);
                 saveConfig(cfg);
-                uiLog(format("[CFG] Заменять нетекстовый буфер: %s", overwriteOn ? "вкл" : "выкл"));
+                uiLog(format(tr("[CFG] Overwrite non-text clipboard: %s", "[CFG] Заменять нетекстовый буфер: %s"),
+                    overwriteOn ? tr("on", "вкл") : tr("off", "выкл")));
             },
             (bool toggleOn) {
                 cfg.toggleMode = toggleOn;
                 saveConfig(cfg);
-                uiLog(format("[CFG] Режим переключения (Toggle): %s", toggleOn ? "вкл" : "выкл"));
+                uiLog(format(tr("[CFG] Toggle mode: %s", "[CFG] Режим переключения (Toggle): %s"),
+                    toggleOn ? tr("on", "вкл") : tr("off", "выкл")));
             },
             (bool checked) {
                 cfg.autoLoadModel = checked;
                 atomicStore(g_state.autoLoadModel, checked);
                 saveConfig(cfg);
-                uiLog(format("[CFG] Автозагрузка модели: %s", checked ? "вкл" : "выкл"));
+                uiLog(format(tr("[CFG] Auto-load model: %s", "[CFG] Автозагрузка модели: %s"),
+                    checked ? tr("on", "вкл") : tr("off", "выкл")));
             },
             (bool cpuOnly) {
                 cfg.useGpu = !cpuOnly;
@@ -804,29 +838,35 @@ version (unittest) {
                 cfg.beep = beepOn;
                 atomicStore(g_state.beepEnabled, beepOn);
                 saveConfig(cfg);
-                uiLog(format("[CFG] Звуковые сигналы: %s", beepOn ? "вкл" : "выкл"));
+                uiLog(format(tr("[CFG] Sound cues: %s", "[CFG] Звуковые сигналы: %s"),
+                    beepOn ? tr("on", "вкл") : tr("off", "выкл")));
             },
             (bool overlayOn) {
                 cfg.showOverlay = overlayOn;
                 saveConfig(cfg);
-                uiLog(format("[CFG] Плавающий индикатор (HUD): %s", overlayOn ? "вкл" : "выкл"));
+                uiLog(format(tr("[CFG] Floating indicator (HUD): %s", "[CFG] Плавающий индикатор (HUD): %s"),
+                    overlayOn ? tr("on", "вкл") : tr("off", "выкл")));
             },
             (bool previewOn) {
                 cfg.livePreview = previewOn;
                 atomicStore(g_state.livePreview, previewOn);
                 saveConfig(cfg);
-                uiLog(format("[CFG] Предпросмотр речи (Live): %s", previewOn ? "вкл" : "выкл"));
+                uiLog(format(tr("[CFG] Live speech preview: %s", "[CFG] Предпросмотр речи (Live): %s"),
+                    previewOn ? tr("on", "вкл") : tr("off", "выкл")));
             },
             (bool checked) {
                 cfg.startMinimized = checked;
                 saveConfig(cfg);
-                uiLog(format("[CFG] Запускать в трее сразу: %s", checked ? "вкл" : "выкл"));
+                uiLog(format(tr("[CFG] Start minimized to tray: %s", "[CFG] Запускать в трее сразу: %s"),
+                    checked ? tr("on", "вкл") : tr("off", "выкл")));
             },
             (bool checked) {
                 if (setWindowsAutostart(checked)) {
-                    uiLog(format("[CFG] Автозапуск с Windows: %s", checked ? "вкл" : "выкл"));
+                    uiLog(format(tr("[CFG] Run with Windows: %s", "[CFG] Автозапуск с Windows: %s"),
+                        checked ? tr("on", "вкл") : tr("off", "выкл")));
                 } else {
-                    uiLog("[ОШИБКА] Не удалось изменить запись автозапуска в реестре.");
+                    uiLog(tr("[ERROR] Failed to update Windows autostart registry entry.",
+                             "[ОШИБКА] Не удалось изменить запись автозапуска в реестре."));
                 }
             },
             () {

@@ -4,6 +4,7 @@ import core.stdc.stdint : int32_t;
 import core.sys.windows.winbase : FreeLibrary, GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH,
     LoadLibraryExW, LoadLibraryW;
 import core.sys.windows.windef : HMODULE;
+import i18n : tr;
 import std.path : isAbsolute;
 import std.utf : toUTF16z;
 
@@ -255,7 +256,9 @@ struct SherpaApi {
             ? LoadLibraryExW(wpath, null, LOAD_WITH_ALTERED_SEARCH_PATH)
             : LoadLibraryW(wpath);
         if (hMod is null) {
-            err = "Не удалось загрузить " ~ dllPath ~ " (положите sherpa-onnx-c-api.dll и onnxruntime.dll рядом с exe)";
+            err = tr("Failed to load ", "Не удалось загрузить ") ~ dllPath
+                ~ tr(" (place sherpa-onnx-c-api.dll and onnxruntime.dll next to exe)",
+                     " (положите sherpa-onnx-c-api.dll и onnxruntime.dll рядом с exe)");
             return false;
         }
 
@@ -285,7 +288,8 @@ struct SherpaApi {
         fn = cast(T) GetProcAddress(hMod, sym);
         if (fn is null) {
             import std.string : fromStringz;
-            err = "В sherpa-onnx-c-api.dll не найдена функция: " ~ sym.fromStringz().idup;
+            err = tr("Function not found in sherpa-onnx-c-api.dll: ", "В sherpa-onnx-c-api.dll не найдена функция: ")
+                ~ sym.fromStringz().idup;
             return false;
         }
         return true;

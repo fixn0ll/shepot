@@ -7,6 +7,7 @@ import core.sys.windows.mmsystem;
 import core.sys.windows.winbase : CRITICAL_SECTION, DeleteCriticalSection, EnterCriticalSection,
     InitializeCriticalSection, LeaveCriticalSection;
 import core.sys.windows.windef : DWORD, DWORD_PTR, UINT;
+import i18n : tr;
 import std.utf : toUTF8;
 import stt_engine : SAMPLE_RATE;
 
@@ -22,7 +23,7 @@ string[] listInputDevices() {
             while (len < caps.szPname.length && caps.szPname[len] != 0) ++len;
             names ~= toUTF8(caps.szPname[0 .. len]);
         } else {
-            names ~= "Устройство #" ~ cast(char)('0' + (i % 10));
+            names ~= tr("Device #", "Устройство #") ~ cast(char)('0' + (i % 10));
         }
     }
     return names;
@@ -60,7 +61,7 @@ struct AudioCapture {
         m_buf = cast(float*) malloc(m_cap * float.sizeof);
         if (m_buf is null) {
             DeleteCriticalSection(&m_cs);
-            err = "Не удалось выделить аудиобуфер";
+            err = tr("Failed to allocate audio buffer", "Не удалось выделить аудиобуфер");
             return false;
         }
         m_len = 0;
@@ -103,7 +104,7 @@ struct AudioCapture {
         );
         if (rc != MMSYSERR_NOERROR) {
             m_handle = null;
-            err = "Не удалось открыть микрофон (waveInOpen)";
+            err = tr("Failed to open microphone (waveInOpen)", "Не удалось открыть микрофон (waveInOpen)");
             return false;
         }
 
@@ -118,7 +119,7 @@ struct AudioCapture {
         rc = waveInStart(m_handle);
         if (rc != MMSYSERR_NOERROR) {
             closeStream();
-            err = "Не удалось запустить поток захвата микрофона (waveInStart)";
+            err = tr("Failed to start microphone capture (waveInStart)", "Не удалось запустить поток захвата микрофона (waveInStart)");
             return false;
         }
         return true;

@@ -24,6 +24,7 @@ import core.sys.windows.winreg : HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RegCloseK
 import core.sys.windows.winuser;
 import core.thread : Thread;
 import core.time : msecs;
+import i18n : getUiLanguage, tr;
 import sound : playClickAsync;
 import std.algorithm : max, min;
 import std.file : exists, mkdirRecurse, thisExePath, write;
@@ -65,6 +66,7 @@ private enum int ID_BTN_CLEAR_LOG = 123;
 private enum int ID_COMBO_THEME = 124;
 private enum int ID_BTN_OPEN_REPL = 125;
 private enum int ID_BTN_OPEN_MODELS = 126;
+private enum int ID_COMBO_UI_LANG = 127;
 
 private enum int ID_TRAY_TOGGLE = 201;
 private enum int ID_TRAY_EXIT = 202;
@@ -86,6 +88,7 @@ private enum int ID_TRAY_LANG_BASE = 3000;
 private enum int ID_TRAY_TIMEOUT_BASE = 4000;
 private enum int ID_TRAY_INPUT_MODE_BASE = 5000;
 private enum int ID_TRAY_THEME_BASE = 6000;
+private enum int ID_TRAY_UI_LANG_BASE = 6100;
 
 private enum size_t ID_TIMER_IDLE = 1;
 private enum size_t ID_TIMER_CLICK = 2;
@@ -109,30 +112,42 @@ struct UiOption {
 }
 
 struct TimeoutOption {
-    string label;
+    string labelEn;
+    string labelRu;
     int minutes;
 }
 
 static immutable TimeoutOption[] timeoutOptions = [
-    TimeoutOption("1 мин", 1),
-    TimeoutOption("3 мин", 3),
-    TimeoutOption("5 мин", 5),
-    TimeoutOption("10 мин", 10),
-    TimeoutOption("15 мин", 15),
-    TimeoutOption("30 мин", 30),
-    TimeoutOption("Никогда", 0),
+    TimeoutOption("1 min", "1 мин", 1),
+    TimeoutOption("3 min", "3 мин", 3),
+    TimeoutOption("5 min", "5 мин", 5),
+    TimeoutOption("10 min", "10 мин", 10),
+    TimeoutOption("15 min", "15 мин", 15),
+    TimeoutOption("30 min", "30 мин", 30),
+    TimeoutOption("Never", "Никогда", 0),
 ];
 
-static immutable UiOption[] inputModeOptions = [
-    UiOption("Посимвольно (игры / SendInput)", "sendinput"),
-    UiOption("Буфер обмена (Ctrl+V)", "clipboard"),
-    UiOption("Авто (<=80 симв. — посимвольно)", "auto"),
+struct LocalizedOption {
+    string labelEn;
+    string labelRu;
+    string value;
+}
+
+static immutable LocalizedOption[] inputModeOptions = [
+    LocalizedOption("Per-character (games / SendInput)", "Посимвольно (игры / SendInput)", "sendinput"),
+    LocalizedOption("Clipboard (Ctrl+V)", "Буфер обмена (Ctrl+V)", "clipboard"),
+    LocalizedOption("Auto (<=80 chars per-character)", "Авто (<=80 симв. — посимвольно)", "auto"),
 ];
 
-static immutable UiOption[] themeOptions = [
-    UiOption("Авто (как в Windows)", "auto"),
-    UiOption("Светлая", "light"),
-    UiOption("Тёмная", "dark"),
+static immutable LocalizedOption[] themeOptions = [
+    LocalizedOption("Auto (follow Windows)", "Авто (как в Windows)", "auto"),
+    LocalizedOption("Light", "Светлая", "light"),
+    LocalizedOption("Dark", "Тёмная", "dark"),
+];
+
+static immutable UiOption[] uiLangOptions = [
+    UiOption("English", "en"),
+    UiOption("Русский", "ru"),
 ];
 
 private struct AppUiState {
@@ -180,6 +195,7 @@ private struct AppUiState {
     void delegate(int) onTimeoutChange;
     void delegate(string) onInputModeChange;
     void delegate(string) onThemeChange;
+    void delegate(string) onUiLangChange;
     void delegate(bool) onOverwriteClipChange;
     void delegate(bool) onToggleModeChange;
     void delegate(bool) onAutoLoadChange;
@@ -218,6 +234,8 @@ private struct AppUiState {
     HWND comboInputMode;
     HWND lblTheme;
     HWND comboTheme;
+    HWND lblUiLang;
+    HWND comboUiLang;
     HWND chkAutoLoad;
     HWND chkCpuOnly;
     HWND chkStartTray;
@@ -272,6 +290,7 @@ private struct AppUiState {
     string[] pendingLogs;
     bool clickTimerActive;
     bool marqueeActive;
+    bool statusIsIdle = true;
 }
 
 private __gshared AppUiState g_ui;
@@ -334,7 +353,7 @@ void closeTempConsole() {
 }
 
 void showErrorBox(string msg) {
-    MessageBoxW(null, msg.toUTF16z(), "Shepot — Ошибка"w.ptr, MB_OK | MB_ICONERROR);
+    MessageBoxW(null, msg.toUTF16z(), tr("Shepot — Error", "Shepot — Ошибка").toUTF16z(), MB_OK | MB_ICONERROR);
 }
 
 /// Проверяет, добавлено ли приложение в автозапуск Windows (HKCU\...\Run).
@@ -416,7 +435,10 @@ private bool pasteViaClipboard(string text, int restoreDelayMs, bool overwriteNo
     if (!hasText && CountClipboardFormats() > 0 && !overwriteNonText) {
         // В буфере картинка, файлы или другие данные — не затираем буфер обмена.
         CloseClipboard();
-        uiLog("[CLIP] В буфере картинка/файлы — вставка посимвольно без затирания (опция «Заменять нетекстовый буфер» выключена).");
+        uiLog(tr(
+            "[CLIP] Clipboard contains image/files — typing per-character without overwriting (\"Overwrite non-text clipboard\" is off).",
+            "[CLIP] В буфере картинка/файлы — вставка посимвольно без затирания (опция «Заменять нетекстовый буфер» выключена)."
+        ));
         return false;
     }
 
@@ -553,6 +575,7 @@ private void typeUnicodeDirect(string text, int charDelayMs) {
 void uiSetStatus(string status) {
     if (g_ui.mtx is null || g_ui.hwnd is null) return;
     g_ui.mtx.lock();
+    g_ui.statusIsIdle = false;
     g_ui.pendingStatus = status;
     g_ui.hasPendingStatus = true;
     g_ui.mtx.unlock();
@@ -562,9 +585,13 @@ void uiSetStatus(string status) {
 void uiSetIdleStatus(bool modelLoaded) {
     if (g_ui.mtx is null || g_ui.hwnd is null) return;
     g_ui.mtx.lock();
+    g_ui.statusIsIdle = true;
     g_ui.pendingStatus = modelLoaded
-        ? ((g_ui.toggleMode ? "Готово — нажмите [" : "Готово — удерживайте [") ~ g_ui.hotkeyName ~ "]")
-        : ("Модель выгружена — нажмите [" ~ g_ui.hotkeyName ~ "] или Загрузить");
+        ? ((g_ui.toggleMode
+            ? tr("Ready — press [", "Готово — нажмите [")
+            : tr("Ready — hold [", "Готово — удерживайте [")) ~ g_ui.hotkeyName ~ "]")
+        : (tr("Model unloaded — press [", "Модель выгружена — нажмите [")
+            ~ g_ui.hotkeyName ~ tr("] or Load", "] или Загрузить"));
     g_ui.hasPendingStatus = true;
     g_ui.mtx.unlock();
     PostMessageW(g_ui.hwnd, WM_APP_SYNC, 0, 0);
@@ -674,6 +701,7 @@ bool runTrayApp(
     void delegate(int) onTimeoutChange,
     void delegate(string) onInputModeChange,
     void delegate(string) onThemeChange,
+    void delegate(string) onUiLangChange,
     void delegate(bool) onOverwriteClipChange,
     void delegate(bool) onToggleModeChange,
     void delegate(bool) onAutoLoadChange,
@@ -732,6 +760,7 @@ bool runTrayApp(
     g_ui.onTimeoutChange = onTimeoutChange;
     g_ui.onInputModeChange = onInputModeChange;
     g_ui.onThemeChange = onThemeChange;
+    g_ui.onUiLangChange = onUiLangChange;
     g_ui.onOverwriteClipChange = onOverwriteClipChange;
     g_ui.onToggleModeChange = onToggleModeChange;
     g_ui.onAutoLoadChange = onAutoLoadChange;
@@ -779,7 +808,7 @@ bool runTrayApp(
     g_ui.hwnd = CreateWindowExW(
         0,
         clsName,
-        "Shepot — Голосовой ввод"w.ptr,
+        tr("Shepot — Voice Dictation", "Shepot — Голосовой ввод").toUTF16z(),
         style,
         CW_USEDEFAULT, CW_USEDEFAULT, 580, 540,
         null, null, hInst, null
@@ -795,8 +824,9 @@ bool runTrayApp(
     populateOptionCombo(g_ui.comboModel, modelOptions, initialModel);
     populateOptionCombo(g_ui.comboLang, langOptions, initialLang);
     populateTimeoutCombo(initialTimeoutMin);
-    populateOptionCombo(g_ui.comboInputMode, cast(UiOption[]) inputModeOptions, g_ui.currentInputMode);
-    populateOptionCombo(g_ui.comboTheme, cast(UiOption[]) themeOptions, g_ui.currentTheme);
+    populateLocalizedCombo(g_ui.comboInputMode, inputModeOptions, g_ui.currentInputMode);
+    populateLocalizedCombo(g_ui.comboTheme, themeOptions, g_ui.currentTheme);
+    populateOptionCombo(g_ui.comboUiLang, cast(UiOption[]) uiLangOptions, getUiLanguage());
 
     SendMessageW(g_ui.chkAutoLoad, BM_SETCHECK, autoLoad ? BST_CHECKED : BST_UNCHECKED, 0);
     syncCpuOnlyControl();
@@ -806,7 +836,7 @@ bool runTrayApp(
     SendMessageW(g_ui.chkOverlay, BM_SETCHECK, showOverlay ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_ui.chkToggleMode, BM_SETCHECK, toggleMode ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_ui.chkOverwriteClip, BM_SETCHECK, overwriteNonTextClip ? BST_CHECKED : BST_UNCHECKED, 0);
-    SetWindowTextW(g_ui.btnHotkey, ("Назначить: [" ~ hotkeyName ~ "]").toUTF16z());
+    SetWindowTextW(g_ui.btnHotkey, (tr("Assign: [", "Назначить: [") ~ hotkeyName ~ "]").toUTF16z());
     applyModelButtonState(initialLoaded, initialLoading);
     refreshModelHint();
     setActivePage(0);
@@ -814,7 +844,7 @@ bool runTrayApp(
 
     foreach (line; initialLogs) uiLog(line);
     if (initialLoading) {
-        uiSetStatus("Загрузка модели...");
+        uiSetStatus(tr("Loading model...", "Загрузка модели..."));
         uiSetProgress(1, 0);
     } else {
         uiSetIdleStatus(initialLoaded);
@@ -926,7 +956,9 @@ private double clamp01(double v) {
 }
 
 private void populateMicCombo(string[] micNames, int initialMic) {
-    SendMessageW(g_ui.comboMic, CB_ADDSTRING, 0, cast(LPARAM) "По умолчанию (Windows)".toUTF16z());
+    SendMessageW(g_ui.comboMic, CB_RESETCONTENT, 0, 0);
+    SendMessageW(g_ui.comboMic, CB_ADDSTRING, 0,
+        cast(LPARAM) tr("Default (Windows)", "По умолчанию (Windows)").toUTF16z());
     foreach (name; micNames) {
         SendMessageW(g_ui.comboMic, CB_ADDSTRING, 0, cast(LPARAM) name.toUTF16z());
     }
@@ -943,16 +975,30 @@ void uiSetModelOptions(UiOption[] options, string currentVal) {
     refreshModelHint();
 }
 
+void uiSetLangOptions(UiOption[] options, string currentVal) {
+    g_ui.langOptions = options;
+    g_ui.currentLang = currentVal;
+    if (g_ui.comboLang !is null) {
+        populateOptionCombo(g_ui.comboLang, options, currentVal);
+    }
+}
+
 private void openCustomModelDialog(HWND hwnd) {
     if (g_ui.onCustomModelPick is null) return;
     wchar[1024] buf = 0;
     OPENFILENAMEW ofn;
     ofn.lStructSize = OPENFILENAMEW.sizeof;
     ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter = "Модели (*.bin;*.onnx;tokens.txt)\0*.bin;*.onnx;tokens.txt\0Whisper GGML (*.bin)\0*.bin\0Sherpa ONNX (*.onnx)\0*.onnx\0Все файлы (*.*)\0*.*\0\0"w.ptr;
+    ofn.lpstrFilter = tr(
+        "Models (*.bin;*.onnx;tokens.txt)\0*.bin;*.onnx;tokens.txt\0Whisper GGML (*.bin)\0*.bin\0Sherpa ONNX (*.onnx)\0*.onnx\0All files (*.*)\0*.*\0\0",
+        "Модели (*.bin;*.onnx;tokens.txt)\0*.bin;*.onnx;tokens.txt\0Whisper GGML (*.bin)\0*.bin\0Sherpa ONNX (*.onnx)\0*.onnx\0Все файлы (*.*)\0*.*\0\0"
+    ).toUTF16z();
     ofn.lpstrFile = buf.ptr;
     ofn.nMaxFile = cast(DWORD) buf.length;
-    ofn.lpstrTitle = "Выберите файл модели (.bin или .onnx / tokens.txt)"w.ptr;
+    ofn.lpstrTitle = tr(
+        "Select model file (.bin or .onnx / tokens.txt)",
+        "Выберите файл модели (.bin или .onnx / tokens.txt)"
+    ).toUTF16z();
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn)) return;
 
@@ -973,10 +1019,21 @@ private void populateOptionCombo(HWND combo, UiOption[] options, string currentV
     SendMessageW(combo, CB_SETCURSEL, sel, 0);
 }
 
+private void populateLocalizedCombo(HWND combo, immutable(LocalizedOption)[] options, string currentVal) {
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    int sel = 0;
+    foreach (i, opt; options) {
+        SendMessageW(combo, CB_ADDSTRING, 0, cast(LPARAM) tr(opt.labelEn, opt.labelRu).toUTF16z());
+        if (opt.value == currentVal) sel = cast(int) i;
+    }
+    SendMessageW(combo, CB_SETCURSEL, sel, 0);
+}
+
 private void populateTimeoutCombo(int minutes) {
+    SendMessageW(g_ui.comboTimeout, CB_RESETCONTENT, 0, 0);
     int sel = 2;
     foreach (i, opt; timeoutOptions) {
-        SendMessageW(g_ui.comboTimeout, CB_ADDSTRING, 0, cast(LPARAM) opt.label.toUTF16z());
+        SendMessageW(g_ui.comboTimeout, CB_ADDSTRING, 0, cast(LPARAM) tr(opt.labelEn, opt.labelRu).toUTF16z());
         if (opt.minutes == minutes) sel = cast(int) i;
     }
     SendMessageW(g_ui.comboTimeout, CB_SETCURSEL, sel, 0);
@@ -986,13 +1043,13 @@ private void applyModelButtonState(bool loaded, bool loading) {
     g_ui.modelLoaded = loaded;
     g_ui.modelLoading = loading;
     if (loading) {
-        SetWindowTextW(g_ui.btnModel, "Загрузка модели..."w.ptr);
+        SetWindowTextW(g_ui.btnModel, tr("Loading model...", "Загрузка модели...").toUTF16z());
         EnableWindow(g_ui.btnModel, FALSE);
     } else if (loaded) {
-        SetWindowTextW(g_ui.btnModel, "Выгрузить модель из памяти"w.ptr);
+        SetWindowTextW(g_ui.btnModel, tr("Unload model from memory", "Выгрузить модель из памяти").toUTF16z());
         EnableWindow(g_ui.btnModel, TRUE);
     } else {
-        SetWindowTextW(g_ui.btnModel, "Загрузить модель"w.ptr);
+        SetWindowTextW(g_ui.btnModel, tr("Load model", "Загрузить модель").toUTF16z());
         EnableWindow(g_ui.btnModel, TRUE);
     }
 }
@@ -1040,7 +1097,7 @@ private void layoutChildren(int w, int h) {
 
     my += 20;
     int mLabelW = 72;
-    int browseW = 78;
+    int browseW = 84;
     int mComboW = w - pad * 2 - mLabelW - browseW - 14;
     MoveWindow(g_ui.lblModel, pad, my + 4, mLabelW, 20, TRUE);
     MoveWindow(g_ui.comboModel, pad + mLabelW + 6, my, mComboW, 220, TRUE);
@@ -1051,7 +1108,7 @@ private void layoutChildren(int w, int h) {
 
     my += 36;
     int clearW = 80;
-    int copyW = 136;
+    int copyW = 140;
     MoveWindow(g_ui.lblLog, pad, my + 4, w - pad * 2 - copyW - clearW - 14, 18, TRUE);
     MoveWindow(g_ui.btnCopyLast, w - pad - clearW - copyW - 6, my, copyW, 24, TRUE);
     MoveWindow(g_ui.btnClearLog, w - pad - clearW, my, clearW, 24, TRUE);
@@ -1087,6 +1144,10 @@ private void layoutChildren(int w, int h) {
     sy += 34;
     MoveWindow(g_ui.lblTheme, pad, sy + 4, labelW, 20, TRUE);
     MoveWindow(g_ui.comboTheme, pad + labelW + 8, sy, ctrlW, 220, TRUE);
+
+    sy += 34;
+    MoveWindow(g_ui.lblUiLang, pad, sy + 4, labelW, 20, TRUE);
+    MoveWindow(g_ui.comboUiLang, pad + labelW + 8, sy, ctrlW, 220, TRUE);
 
     sy += 38;
     int halfW = (w - pad * 3) / 2;
@@ -1147,91 +1208,94 @@ private void showTrayMenu(HWND hwnd) {
     GetCursorPos(&pt);
 
     HMENU menu = CreatePopupMenu();
-    auto toggleText = IsWindowVisible(hwnd) ? "Скрыть в трей"w.ptr : "Показать окно"w.ptr;
+    auto toggleText = (IsWindowVisible(hwnd) ? tr("Hide to Tray", "Скрыть в трей") : tr("Show Window", "Показать окно")).toUTF16z();
     AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, toggleText);
     UINT copyFlags = MF_STRING | (g_ui.lastPhrase.length > 0 ? 0 : MF_GRAYED);
-    AppendMenuW(menu, copyFlags, ID_TRAY_COPY_LAST, "Скопировать последнюю фразу"w.ptr);
+    AppendMenuW(menu, copyFlags, ID_TRAY_COPY_LAST, tr("Copy Last Phrase", "Скопировать последнюю фразу").toUTF16z());
     AppendMenuW(menu, MF_SEPARATOR, 0, null);
 
     string modelBtnLabel = g_ui.modelLoading
-        ? "Загрузка модели..."
-        : (g_ui.modelLoaded ? "Выгрузить модель из памяти" : "Загрузить модель");
+        ? tr("Loading model...", "Загрузка модели...")
+        : (g_ui.modelLoaded ? tr("Unload model from memory", "Выгрузить модель из памяти") : tr("Load model", "Загрузить модель"));
     UINT modelFlags = MF_STRING | (g_ui.modelLoading ? MF_GRAYED : 0);
     AppendMenuW(menu, modelFlags, ID_TRAY_MODEL_TOGGLE, modelBtnLabel.toUTF16z());
 
-    // Подменю моделей
     HMENU subModel = CreatePopupMenu();
     foreach (i, opt; g_ui.modelOptions) {
         UINT fl = MF_STRING | (opt.value == g_ui.currentModel ? MF_CHECKED : MF_UNCHECKED);
         AppendMenuW(subModel, fl, ID_TRAY_MODEL_BASE + i, opt.label.toUTF16z());
     }
     AppendMenuW(subModel, MF_SEPARATOR, 0, null);
-    AppendMenuW(subModel, MF_STRING, ID_TRAY_BROWSE_MODEL, "Выбрать свою модель..."w.ptr);
-    AppendMenuW(menu, MF_POPUP, cast(size_t) subModel, "Модель"w.ptr);
+    AppendMenuW(subModel, MF_STRING, ID_TRAY_BROWSE_MODEL, tr("Browse custom model...", "Выбрать свою модель...").toUTF16z());
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subModel, tr("Model", "Модель").toUTF16z());
 
-    // Подменю языков
     HMENU subLang = CreatePopupMenu();
     foreach (i, opt; g_ui.langOptions) {
         UINT fl = MF_STRING | (opt.value == g_ui.currentLang ? MF_CHECKED : MF_UNCHECKED);
         AppendMenuW(subLang, fl, ID_TRAY_LANG_BASE + i, opt.label.toUTF16z());
     }
-    AppendMenuW(menu, MF_POPUP, cast(size_t) subLang, "Язык речи"w.ptr);
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subLang, tr("Speech Language", "Язык речи").toUTF16z());
 
-    // Подменю микрофонов
     HMENU subMic = CreatePopupMenu();
     AppendMenuW(subMic, MF_STRING | (g_ui.currentMic < 0 ? MF_CHECKED : MF_UNCHECKED),
-        ID_TRAY_MIC_BASE, "По умолчанию (Windows)"w.ptr);
+        ID_TRAY_MIC_BASE, tr("Default (Windows)", "По умолчанию (Windows)").toUTF16z());
     foreach (i, name; g_ui.micNames) {
         UINT fl = MF_STRING | (g_ui.currentMic == cast(int) i ? MF_CHECKED : MF_UNCHECKED);
         AppendMenuW(subMic, fl, ID_TRAY_MIC_BASE + 1 + i, name.toUTF16z());
     }
-    AppendMenuW(menu, MF_POPUP, cast(size_t) subMic, "Микрофон"w.ptr);
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subMic, tr("Microphone", "Микрофон").toUTF16z());
 
-    // Подменю автовыгрузки
     HMENU subTimeout = CreatePopupMenu();
     foreach (i, opt; timeoutOptions) {
         UINT fl = MF_STRING | (opt.minutes == g_ui.currentTimeoutMin ? MF_CHECKED : MF_UNCHECKED);
-        AppendMenuW(subTimeout, fl, ID_TRAY_TIMEOUT_BASE + i, opt.label.toUTF16z());
+        AppendMenuW(subTimeout, fl, ID_TRAY_TIMEOUT_BASE + i, tr(opt.labelEn, opt.labelRu).toUTF16z());
     }
-    AppendMenuW(menu, MF_POPUP, cast(size_t) subTimeout, "Автовыгрузка (VRAM)"w.ptr);
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subTimeout, tr("Auto-unload (VRAM)", "Автовыгрузка (VRAM)").toUTF16z());
 
-    // Подменю режима ввода
     HMENU subInputMode = CreatePopupMenu();
     foreach (i, opt; inputModeOptions) {
         UINT fl = MF_STRING | (opt.value == g_ui.currentInputMode ? MF_CHECKED : MF_UNCHECKED);
-        AppendMenuW(subInputMode, fl, ID_TRAY_INPUT_MODE_BASE + i, opt.label.toUTF16z());
+        AppendMenuW(subInputMode, fl, ID_TRAY_INPUT_MODE_BASE + i, tr(opt.labelEn, opt.labelRu).toUTF16z());
     }
-    AppendMenuW(menu, MF_POPUP, cast(size_t) subInputMode, "Режим ввода"w.ptr);
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subInputMode, tr("Input Mode", "Режим ввода").toUTF16z());
 
     HMENU subTheme = CreatePopupMenu();
     foreach (i, opt; themeOptions) {
         UINT fl = MF_STRING | (opt.value == g_ui.currentTheme ? MF_CHECKED : MF_UNCHECKED);
-        AppendMenuW(subTheme, fl, ID_TRAY_THEME_BASE + i, opt.label.toUTF16z());
+        AppendMenuW(subTheme, fl, ID_TRAY_THEME_BASE + i, tr(opt.labelEn, opt.labelRu).toUTF16z());
     }
-    AppendMenuW(menu, MF_POPUP, cast(size_t) subTheme, "Тема оформления"w.ptr);
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subTheme, tr("Theme", "Тема оформления").toUTF16z());
+
+    HMENU subUiLang = CreatePopupMenu();
+    auto curUiLang = getUiLanguage();
+    foreach (i, opt; uiLangOptions) {
+        UINT fl = MF_STRING | (opt.value == curUiLang ? MF_CHECKED : MF_UNCHECKED);
+        AppendMenuW(subUiLang, fl, ID_TRAY_UI_LANG_BASE + i, opt.label.toUTF16z());
+    }
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subUiLang, tr("UI Language", "Язык интерфейса").toUTF16z());
 
     AppendMenuW(menu, MF_STRING, ID_TRAY_HOTKEY,
-        ("Назначить клавишу [" ~ g_ui.hotkeyName ~ "]").toUTF16z());
+        (tr("Assign Hotkey [", "Назначить клавишу [") ~ g_ui.hotkeyName ~ "]").toUTF16z());
     AppendMenuW(menu, MF_STRING | (g_ui.toggleMode ? MF_CHECKED : MF_UNCHECKED),
-        ID_TRAY_TOGGLE_MODE, "Режим переключения (Toggle)"w.ptr);
+        ID_TRAY_TOGGLE_MODE, tr("Toggle Mode", "Режим переключения (Toggle)").toUTF16z());
     AppendMenuW(menu, MF_STRING | (g_ui.overwriteNonTextClip ? MF_CHECKED : MF_UNCHECKED),
-        ID_TRAY_OVERWRITE_CLIP, "Заменять нетекстовый буфер"w.ptr);
+        ID_TRAY_OVERWRITE_CLIP, tr("Overwrite non-text clipboard", "Заменять нетекстовый буфер").toUTF16z());
 
     AppendMenuW(menu, MF_SEPARATOR, 0, null);
     bool cpuDisplay = !g_ui.gpuAvailable || g_ui.cpuOnly;
     UINT cpuFlags = MF_STRING | (cpuDisplay ? MF_CHECKED : MF_UNCHECKED) | (g_ui.gpuAvailable ? 0 : MF_GRAYED);
-    AppendMenuW(menu, cpuFlags, ID_TRAY_CPU_ONLY, "Только на процессоре (CPU)"w.ptr);
+    AppendMenuW(menu, cpuFlags, ID_TRAY_CPU_ONLY, tr("CPU only", "Только на процессоре (CPU)").toUTF16z());
     AppendMenuW(menu, MF_STRING | (g_ui.beepEnabled ? MF_CHECKED : MF_UNCHECKED),
-        ID_TRAY_BEEP, "Звуковые сигналы"w.ptr);
+        ID_TRAY_BEEP, tr("Sound cues", "Звуковые сигналы").toUTF16z());
     AppendMenuW(menu, MF_STRING | (g_ui.showOverlay ? MF_CHECKED : MF_UNCHECKED),
-        ID_TRAY_OVERLAY, "Плавающий индикатор (HUD)"w.ptr);
+        ID_TRAY_OVERLAY, tr("Floating indicator (HUD)", "Плавающий индикатор (HUD)").toUTF16z());
     AppendMenuW(menu, MF_STRING | (g_ui.livePreview ? MF_CHECKED : MF_UNCHECKED),
-        ID_TRAY_LIVE_PREVIEW, "Предпросмотр речи в HUD (Live)"w.ptr);
+        ID_TRAY_LIVE_PREVIEW, tr("Live speech preview (HUD)", "Предпросмотр речи в HUD (Live)").toUTF16z());
     AppendMenuW(menu, MF_STRING | (g_ui.winAutostart ? MF_CHECKED : MF_UNCHECKED),
-        ID_TRAY_WIN_AUTO, "Запускать с Windows"w.ptr);
+        ID_TRAY_WIN_AUTO, tr("Run with Windows", "Запускать с Windows").toUTF16z());
 
     AppendMenuW(menu, MF_SEPARATOR, 0, null);
-    AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, "Выход"w.ptr);
+    AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, tr("Exit", "Выход").toUTF16z());
 
     SetForegroundWindow(hwnd);
     TrackPopupMenu(menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, null);
@@ -1378,7 +1442,7 @@ private void flushPendingUi(HWND hwnd) {
     if (progMode >= 0) {
         applyProgressState(progMode, progPct);
         if (progMode == 2 && g_ui.hudState == VisualState.processing && g_ui.hudWnd !is null && g_ui.showOverlay) {
-            g_ui.hudText = format("Обработка голоса... %s%%", progPct);
+            g_ui.hudText = format(tr("Processing voice... %s%%", "Обработка голоса... %s%%"), progPct);
             InvalidateRect(g_ui.hudWnd, null, TRUE);
         }
     }
@@ -1530,6 +1594,13 @@ private void applyThemeSelection(int idx) {
     if (g_ui.onThemeChange !is null) g_ui.onThemeChange(g_ui.currentTheme);
 }
 
+private void applyUiLangSelection(int idx) {
+    if (idx < 0 || idx >= cast(int) uiLangOptions.length) return;
+    auto langVal = uiLangOptions[idx].value;
+    SendMessageW(g_ui.comboUiLang, CB_SETCURSEL, idx, 0);
+    if (g_ui.onUiLangChange !is null) g_ui.onUiLangChange(langVal);
+}
+
 private bool isWindowsDarkTheme() {
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
@@ -1585,13 +1656,14 @@ private void applyWindowTheme(HWND hwnd) {
             }
             foreach (c; [
                 g_ui.comboMic, g_ui.comboModel, g_ui.comboLang,
-                g_ui.comboTimeout, g_ui.comboInputMode, g_ui.comboTheme,
+                g_ui.comboTimeout, g_ui.comboInputMode, g_ui.comboTheme, g_ui.comboUiLang,
             ]) {
                 if (c !is null) pTheme(c, cfdName, null);
             }
             foreach (c; [
                 g_ui.lblStatus, g_ui.lblModel, g_ui.lblModelHint, g_ui.lblLog, g_ui.lblMic,
                 g_ui.lblLang, g_ui.lblHotkey, g_ui.lblTimeout, g_ui.lblInputMode, g_ui.lblTheme,
+                g_ui.lblUiLang,
             ]) {
                 if (c !is null) pTheme(c, dark ? ""w.ptr : null, dark ? ""w.ptr : null);
             }
@@ -1626,6 +1698,7 @@ private void setActivePage(int page) {
         g_ui.lblMic, g_ui.comboMic, g_ui.lblLang, g_ui.comboLang,
         g_ui.lblHotkey, g_ui.btnHotkey, g_ui.lblTimeout, g_ui.comboTimeout,
         g_ui.lblInputMode, g_ui.comboInputMode, g_ui.lblTheme, g_ui.comboTheme,
+        g_ui.lblUiLang, g_ui.comboUiLang,
         g_ui.chkAutoLoad, g_ui.chkCpuOnly, g_ui.chkStartTray, g_ui.chkWinAuto,
         g_ui.chkLivePreview, g_ui.chkOverlay, g_ui.chkToggleMode, g_ui.chkOverwriteClip,
         g_ui.btnOpenReplacements, g_ui.btnOpenModelsDir,
@@ -1639,7 +1712,7 @@ private void openReplacementsFile(HWND hwnd) {
     auto path = buildPath(dirName(thisExePath()), "replacements.json");
     if (!exists(path)) {
         try {
-            write(path, "{\n  \"вишпер\": \"Whisper\"\n}\n");
+            write(path, tr("{\n  \"teh\": \"the\"\n}\n", "{\n  \"вишпер\": \"Whisper\"\n}\n"));
         } catch (Exception) {
         }
     }
@@ -1806,9 +1879,9 @@ private void refreshModelHint(int idxOverride = -1) nothrow {
         }
         string hint = (found && opt.hint.length > 0)
             ? opt.hint
-            : "Пользовательская модель (выбрана из локального файла).";
+            : tr("Custom model (selected from local file).", "Пользовательская модель (выбрана из локального файла).");
         if (g_ui.lblModelHint !is null) {
-            SetWindowTextW(g_ui.lblModelHint, ("Рекомендация: " ~ hint).toUTF16z());
+            SetWindowTextW(g_ui.lblModelHint, (tr("Recommendation: ", "Рекомендация: ") ~ hint).toUTF16z());
         }
         if (g_ui.hwndTip !is null && g_ui.comboModel !is null) {
             string tip = found ? (opt.label ~ "\r\n" ~ hint) : hint;
@@ -1830,44 +1903,171 @@ private extern (Windows) LRESULT comboListHoverProc(HWND hwnd, UINT msg, WPARAM 
     return res;
 }
 
-private void installAllTooltips(HWND hwnd) {
-    g_ui.hwndTip = CreateWindowExW(
-        WS_EX_TOPMOST, TOOLTIPS_CLASS.toUTF16z(), null,
-        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-        hwnd, null, GetModuleHandleW(null), null
-    );
+private void installAllTooltips(HWND hwnd, bool add = true) {
+    if (add && g_ui.hwndTip is null) {
+        g_ui.hwndTip = CreateWindowExW(
+            WS_EX_TOPMOST, TOOLTIPS_CLASS.toUTF16z(), null,
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            hwnd, null, GetModuleHandleW(null), null
+        );
+        if (g_ui.hwndTip is null) return;
+        SendMessageW(g_ui.hwndTip, TTM_SETMAXTIPWIDTH, 0, 360);
+        SendMessageW(g_ui.hwndTip, TTM_SETDELAYTIME, TTDT_INITIAL, 350);
+        SendMessageW(g_ui.hwndTip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 15000);
+    }
     if (g_ui.hwndTip is null) return;
 
-    SendMessageW(g_ui.hwndTip, TTM_SETMAXTIPWIDTH, 0, 360);
-    SendMessageW(g_ui.hwndTip, TTM_SETDELAYTIME, TTDT_INITIAL, 350);
-    SendMessageW(g_ui.hwndTip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 15000);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnNavMain, tr(
+        "Main page: status, model selection, and recognition log.",
+        "Главная страница: статус, модель и журнал распознавания."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnNavSettings, tr(
+        "Settings: microphone, language, hotkey, input mode, and theme.",
+        "Настройки микрофона, языка, клавиши, ввода и темы."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnHide, tr(
+        "Minimize window to the system tray (app keeps running).",
+        "Свернуть окно в системный трей (программа продолжит работать)."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnModel, tr(
+        "Load the selected model into RAM/VRAM or unload it to free memory.",
+        "Загрузить выбранную модель в память (RAM/VRAM) или выгрузить её для освобождения памяти."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboModel, tr(
+        "Select speech recognition model. Hover an item in the list to preview its recommendation below.",
+        "Выбор нейросети распознавания. При наведении на пункт списка ниже показывается рекомендация."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnBrowseModel, tr(
+        "Pick a local model: Whisper (.bin) or sherpa-onnx (.onnx / tokens.txt).",
+        "Указать свою локальную модель: файл Whisper (.bin) или файл/папку sherpa-onnx (.onnx / tokens.txt)."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnCopyLast, tr(
+        "Copy the last recognized phrase to the clipboard.",
+        "Скопировать последнюю распознанную фразу в буфер обмена."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnClearLog, tr(
+        "Clear the log text in this window.",
+        "Очистить текстовый журнал работы в этом окне."
+    ), add);
 
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnNavMain, "Главная страница: статус, модель и журнал распознавания.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnNavSettings, "Настройки микрофона, языка, клавиши, ввода и темы.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnHide, "Свернуть окно в системный трей (программа продолжит работать).", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnModel, "Загрузить выбранную модель в память (RAM/VRAM) или выгрузить её для освобождения памяти.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboModel, "Выбор нейросети распознавания. При наведении на пункт списка ниже показывается рекомендация.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnBrowseModel, "Указать свою локальную модель: файл Whisper (.bin) или файл/папку sherpa-onnx (.onnx / tokens.txt).", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnCopyLast, "Скопировать последнюю распознанную фразу в буфер обмена.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnClearLog, "Очистить текстовый журнал работы в этом окне.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboMic, tr(
+        "Choose recording microphone (Windows default device is used by default).",
+        "Выбор микрофона для записи (по умолчанию используется устройство записи Windows)."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboLang, tr(
+        "Expected speech language (for Whisper and some ONNX models; 'auto' detects automatically).",
+        "Ожидаемый язык речи (для Whisper и части ONNX-моделей; «auto» определяет язык автоматически)."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnHotkey, tr(
+        "Click and press any key or mouse button (MOUSE4/MOUSE5, etc.) to bind recording trigger.",
+        "Нажмите и затем нажмите нужную клавишу или кнопку мыши (MOUSE4/MOUSE5 и др.) для записи."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboTimeout, tr(
+        "Automatically unload model after idle minutes to save VRAM/RAM.",
+        "Через сколько минут бездействия выгружать модель из памяти для экономии VRAM/RAM."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboInputMode, tr(
+        "Per-character — for games/windows blocking Ctrl+V;\r\nClipboard — instant paste;\r\nAuto — <=80 chars per-character, longer via clipboard.",
+        "Посимвольно — для игр и окон без Ctrl+V;\r\nБуфер обмена — мгновенная вставка;\r\nАвто — до 80 симв. посимвольно, длиннее через буфер."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboTheme, tr(
+        "Window color theme: Auto (follow Windows), Light, or Dark.",
+        "Выбор оформления окна: Авто (следует теме Windows), Светлая или Тёмная."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboUiLang, tr(
+        "Select interface language (English or Russian).",
+        "Выбор языка интерфейса программы (английский или русский)."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkAutoLoad, tr(
+        "Automatically load the model when Shepot starts.",
+        "Автоматически загружать модель при запуске Shepot."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkCpuOnly, tr(
+        "Run Whisper on CPU instead of GPU (always disabled/checked for CPU-only engines).",
+        "Запускать Whisper на процессоре вместо видеокарты (недоступно для движков без GPU)."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkStartTray, tr(
+        "Start minimized to the system tray.",
+        "Запускать программу сразу свёрнутой в системный трей."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkWinAuto, tr(
+        "Launch Shepot automatically when signing in to Windows.",
+        "Автоматически запускать Shepot при входе в Windows."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkLivePreview, tr(
+        "Show live partial transcription inside the floating HUD while speaking.",
+        "Показывать промежуточный текст в плавающем HUD-индикаторе прямо во время диктовки."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkOverlay, tr(
+        "Small floating recording status indicator at the bottom of the screen.",
+        "Небольшой плавающий индикатор статуса записи внизу экрана."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkToggleMode, tr(
+        "Press once to start recording, press again to stop (instead of holding).",
+        "Нажал — идёт запись, нажал повторно — остановка (вместо удержания кнопки)."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkOverwriteClip, tr(
+        "When off: if clipboard has an image/files, text is typed per-character without losing clipboard.\r\nWhen on: always paste via Ctrl+V.",
+        "Если выкл.: при наличии картинки/файлов в буфере обмена текст введётся посимвольно без потери картинки.\r\nЕсли вкл.: всегда вставлять через Ctrl+V."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnOpenReplacements, tr(
+        "Open auto-replacements file bin/replacements.json (creates a template if missing).",
+        "Открыть файл автозамен bin/replacements.json (создаёт шаблон при первом открытии)."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnOpenModelsDir, tr(
+        "Open bin/models/ folder in File Explorer to add custom models.",
+        "Открыть папку bin/models/ в Проводнике для добавления своих моделей."
+    ), add);
+}
 
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboMic, "Выбор микрофона для записи (по умолчанию используется устройство записи Windows).", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboLang, "Ожидаемый язык речи (для Whisper и части ONNX-моделей; «auto» определяет язык автоматически).", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnHotkey, "Нажмите и затем нажмите нужную клавишу или кнопку мыши (MOUSE4/MOUSE5 и др.) для записи.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboTimeout, "Через сколько минут бездействия выгружать модель из памяти для экономии VRAM/RAM.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboInputMode, "Посимвольно — для игр и окон без Ctrl+V;\r\nБуфер обмена — мгновенная вставка;\r\nАвто — до 80 симв. посимвольно, длиннее через буфер.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboTheme, "Выбор оформления окна: Авто (следует теме Windows), Светлая или Тёмная.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkAutoLoad, "Автоматически загружать модель при запуске Shepot.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkCpuOnly, "Запускать Whisper на процессоре вместо видеокарты (недоступно для движков без GPU).", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkStartTray, "Запускать программу сразу свёрнутой в системный трей.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkWinAuto, "Автоматически запускать Shepot при входе в Windows.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkLivePreview, "Показывать промежуточный текст в плавающем HUD-индикаторе прямо во время диктовки.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkOverlay, "Небольшой плавающий индикатор статуса записи внизу экрана.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkToggleMode, "Нажал — идёт запись, нажал повторно — остановка (вместо удержания кнопки).", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkOverwriteClip, "Если выкл.: при наличии картинки/файлов в буфере обмена текст введётся посимвольно без потери картинки.\r\nЕсли вкл.: всегда вставлять через Ctrl+V.", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnOpenReplacements, "Открыть файл автозамен bin/replacements.json (создаёт шаблон при первом открытии).", true);
-    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnOpenModelsDir, "Открыть папку bin/models/ в Проводнике для добавления своих моделей.", true);
+void uiRefreshLanguage() {
+    if (g_ui.hwnd is null) return;
+    SetWindowTextW(g_ui.hwnd, tr("Shepot — Voice Dictation", "Shepot — Голосовой ввод").toUTF16z());
+    SetWindowTextW(g_ui.btnNavMain, tr("Main", "Главная").toUTF16z());
+    SetWindowTextW(g_ui.btnNavSettings, tr("Settings", "Настройки").toUTF16z());
+    SetWindowTextW(g_ui.btnHide, tr("Hide to Tray", "Скрыть в трей").toUTF16z());
+    applyModelButtonState(g_ui.modelLoaded, g_ui.modelLoading);
+    SetWindowTextW(g_ui.lblModel, tr("Model:", "Модель:").toUTF16z());
+    SetWindowTextW(g_ui.btnBrowseModel, tr("Browse...", "Обзор...").toUTF16z());
+    SetWindowTextW(g_ui.lblLog, tr("Activity Log:", "Журнал работы:").toUTF16z());
+    SetWindowTextW(g_ui.btnCopyLast, tr("Copy Last Phrase", "Копировать фразу").toUTF16z());
+    SetWindowTextW(g_ui.btnClearLog, tr("Clear", "Очистить").toUTF16z());
+
+    SetWindowTextW(g_ui.lblMic, tr("Microphone:", "Микрофон:").toUTF16z());
+    SetWindowTextW(g_ui.lblLang, tr("Speech Language:", "Язык речи:").toUTF16z());
+    SetWindowTextW(g_ui.lblHotkey, tr("Activation Hotkey:", "Клавиша активации:").toUTF16z());
+    if (!g_ui.capturingHotkey) {
+        SetWindowTextW(g_ui.btnHotkey, (tr("Assign: [", "Назначить: [") ~ g_ui.hotkeyName ~ "]").toUTF16z());
+    }
+    SetWindowTextW(g_ui.lblTimeout, tr("Auto-unload (memory):", "Автовыгрузка (память):").toUTF16z());
+    SetWindowTextW(g_ui.lblInputMode, tr("Input Mode:", "Режим ввода:").toUTF16z());
+    SetWindowTextW(g_ui.lblTheme, tr("Theme:", "Тема оформления:").toUTF16z());
+    SetWindowTextW(g_ui.lblUiLang, tr("UI Language:", "Язык интерфейса:").toUTF16z());
+
+    SetWindowTextW(g_ui.chkAutoLoad, tr("Auto-load model", "Автозагрузка модели").toUTF16z());
+    SetWindowTextW(g_ui.chkCpuOnly, tr("CPU only", "Только на процессоре (CPU)").toUTF16z());
+    SetWindowTextW(g_ui.chkStartTray, tr("Start minimized to tray", "Запускать в трее сразу").toUTF16z());
+    SetWindowTextW(g_ui.chkWinAuto, tr("Run with Windows", "Запускать с Windows").toUTF16z());
+    SetWindowTextW(g_ui.chkLivePreview, tr("Live preview in HUD", "Предпросмотр в HUD (Live)").toUTF16z());
+    SetWindowTextW(g_ui.chkOverlay, tr("Floating indicator (HUD)", "Плавающий индикатор (HUD)").toUTF16z());
+    SetWindowTextW(g_ui.chkToggleMode, tr("Toggle mode", "Режим переключения (Toggle)").toUTF16z());
+    SetWindowTextW(g_ui.chkOverwriteClip, tr("Overwrite non-text clipboard", "Заменять нетекстовый буфер").toUTF16z());
+    SetWindowTextW(g_ui.btnOpenReplacements, tr("Replacements (replacements.json)", "Словарь замен (replacements.json)").toUTF16z());
+    SetWindowTextW(g_ui.btnOpenModelsDir, tr("Open models folder", "Открыть папку моделей").toUTF16z());
+
+    populateMicCombo(g_ui.micNames, g_ui.currentMic);
+    populateTimeoutCombo(g_ui.currentTimeoutMin);
+    populateLocalizedCombo(g_ui.comboInputMode, inputModeOptions, g_ui.currentInputMode);
+    populateLocalizedCombo(g_ui.comboTheme, themeOptions, g_ui.currentTheme);
+    populateOptionCombo(g_ui.comboUiLang, cast(UiOption[]) uiLangOptions, getUiLanguage());
+    refreshModelHint();
+    installAllTooltips(g_ui.hwnd, false);
+
+    if (g_ui.statusIsIdle && !g_ui.isDown && !g_ui.modelLoading) {
+        uiSetIdleStatus(g_ui.modelLoaded);
+    }
+    RedrawWindow(g_ui.hwnd, null, null, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 private void installDarkButtonSubclass(HWND ctrl) {
@@ -1890,18 +2090,18 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 g_ui.darkEditBrush = CreateSolidBrush(RGB(15, 15, 18));
                 g_ui.darkSurfaceBrush = CreateSolidBrush(RGB(32, 32, 37));
 
-                g_ui.btnNavMain = CreateWindowExW(0, "BUTTON"w.ptr, "Главная"w.ptr,
+                g_ui.btnNavMain = CreateWindowExW(0, "BUTTON"w.ptr, tr("Main", "Главная").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | BS_PUSHLIKE | WS_GROUP,
                     0, 0, 0, 0, hwnd, cast(HMENU) cast(size_t) ID_NAV_MAIN, hInst, null);
-                g_ui.btnNavSettings = CreateWindowExW(0, "BUTTON"w.ptr, "Настройки"w.ptr,
+                g_ui.btnNavSettings = CreateWindowExW(0, "BUTTON"w.ptr, tr("Settings", "Настройки").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | BS_PUSHLIKE,
                     0, 0, 0, 0, hwnd, cast(HMENU) cast(size_t) ID_NAV_SETTINGS, hInst, null);
-                g_ui.lblStatus = CreateWindowExW(0, "STATIC"w.ptr, "Инициализация..."w.ptr,
+                g_ui.lblStatus = CreateWindowExW(0, "STATIC"w.ptr, tr("Initializing...", "Инициализация...").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 0, 0, 0, 0, hwnd, null, hInst, null);
-                g_ui.btnHide = CreateWindowExW(0, "BUTTON"w.ptr, "Скрыть в трей"w.ptr,
+                g_ui.btnHide = CreateWindowExW(0, "BUTTON"w.ptr, tr("Hide to Tray", "Скрыть в трей").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_HIDE, hInst, null);
-                g_ui.btnModel = CreateWindowExW(0, "BUTTON"w.ptr, "Загрузить модель"w.ptr,
+                g_ui.btnModel = CreateWindowExW(0, "BUTTON"w.ptr, tr("Load model", "Загрузить модель").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_MODEL, hInst, null);
                 g_ui.progressBar = CreateWindowExW(0, PROGRESS_CLASS.toUTF16z(), ""w.ptr,
@@ -1909,92 +2109,98 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     hwnd, cast(HMENU) cast(size_t) ID_PROGRESS, hInst, null);
                 SendMessageW(g_ui.progressBar, PBM_SETRANGE, 0, 100 << 16);
 
-                g_ui.lblMic = CreateWindowExW(0, "STATIC"w.ptr, "Микрофон:"w.ptr,
+                g_ui.lblMic = CreateWindowExW(0, "STATIC"w.ptr, tr("Microphone:", "Микрофон:").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.comboMic = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_MIC, hInst, null);
 
-                g_ui.lblModel = CreateWindowExW(0, "STATIC"w.ptr, "Модель:"w.ptr,
+                g_ui.lblModel = CreateWindowExW(0, "STATIC"w.ptr, tr("Model:", "Модель:").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.comboModel = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_MODEL, hInst, null);
-                g_ui.btnBrowseModel = CreateWindowExW(0, "BUTTON"w.ptr, "Обзор..."w.ptr,
+                g_ui.btnBrowseModel = CreateWindowExW(0, "BUTTON"w.ptr, tr("Browse...", "Обзор...").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_BROWSE_MODEL, hInst, null);
                 g_ui.lblModelHint = CreateWindowExW(0, "STATIC"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
 
-                g_ui.lblLang = CreateWindowExW(0, "STATIC"w.ptr, "Язык речи:"w.ptr,
+                g_ui.lblLang = CreateWindowExW(0, "STATIC"w.ptr, tr("Speech Language:", "Язык речи:").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.comboLang = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_LANG, hInst, null);
 
-                g_ui.lblHotkey = CreateWindowExW(0, "STATIC"w.ptr, "Клавиша активации:"w.ptr,
+                g_ui.lblHotkey = CreateWindowExW(0, "STATIC"w.ptr, tr("Activation Hotkey:", "Клавиша активации:").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
-                g_ui.btnHotkey = CreateWindowExW(0, "BUTTON"w.ptr, "Назначить: [F9]"w.ptr,
+                g_ui.btnHotkey = CreateWindowExW(0, "BUTTON"w.ptr, tr("Assign: [F9]", "Назначить: [F9]").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_HOTKEY, hInst, null);
 
-                g_ui.lblTimeout = CreateWindowExW(0, "STATIC"w.ptr, "Автовыгрузка (память):"w.ptr,
+                g_ui.lblTimeout = CreateWindowExW(0, "STATIC"w.ptr, tr("Auto-unload (memory):", "Автовыгрузка (память):").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.comboTimeout = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_TIMEOUT, hInst, null);
 
-                g_ui.lblInputMode = CreateWindowExW(0, "STATIC"w.ptr, "Режим ввода:"w.ptr,
+                g_ui.lblInputMode = CreateWindowExW(0, "STATIC"w.ptr, tr("Input Mode:", "Режим ввода:").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.comboInputMode = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_INPUT_MODE, hInst, null);
 
-                g_ui.lblTheme = CreateWindowExW(0, "STATIC"w.ptr, "Тема оформления:"w.ptr,
+                g_ui.lblTheme = CreateWindowExW(0, "STATIC"w.ptr, tr("Theme:", "Тема оформления:").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.comboTheme = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_THEME, hInst, null);
 
-                g_ui.chkAutoLoad = CreateWindowExW(0, "BUTTON"w.ptr, "Автозагрузка модели"w.ptr,
+                g_ui.lblUiLang = CreateWindowExW(0, "STATIC"w.ptr, tr("UI Language:", "Язык интерфейса:").toUTF16z(),
+                    WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
+                g_ui.comboUiLang = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
+                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_COMBO_UI_LANG, hInst, null);
+
+                g_ui.chkAutoLoad = CreateWindowExW(0, "BUTTON"w.ptr, tr("Auto-load model", "Автозагрузка модели").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_AUTOLOAD, hInst, null);
-                g_ui.chkCpuOnly = CreateWindowExW(0, "BUTTON"w.ptr, "Только на процессоре (CPU)"w.ptr,
+                g_ui.chkCpuOnly = CreateWindowExW(0, "BUTTON"w.ptr, tr("CPU only", "Только на процессоре (CPU)").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_CPU_ONLY, hInst, null);
-                g_ui.chkStartTray = CreateWindowExW(0, "BUTTON"w.ptr, "Запускать в трее сразу"w.ptr,
+                g_ui.chkStartTray = CreateWindowExW(0, "BUTTON"w.ptr, tr("Start minimized to tray", "Запускать в трее сразу").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_START_TRAY, hInst, null);
-                g_ui.chkWinAuto = CreateWindowExW(0, "BUTTON"w.ptr, "Запускать с Windows"w.ptr,
+                g_ui.chkWinAuto = CreateWindowExW(0, "BUTTON"w.ptr, tr("Run with Windows", "Запускать с Windows").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_WIN_AUTO, hInst, null);
-                g_ui.chkLivePreview = CreateWindowExW(0, "BUTTON"w.ptr, "Предпросмотр в HUD (Live)"w.ptr,
+                g_ui.chkLivePreview = CreateWindowExW(0, "BUTTON"w.ptr, tr("Live preview in HUD", "Предпросмотр в HUD (Live)").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_LIVE_PREVIEW, hInst, null);
-                g_ui.chkOverlay = CreateWindowExW(0, "BUTTON"w.ptr, "Плавающий индикатор (HUD)"w.ptr,
+                g_ui.chkOverlay = CreateWindowExW(0, "BUTTON"w.ptr, tr("Floating indicator (HUD)", "Плавающий индикатор (HUD)").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_OVERLAY, hInst, null);
-                g_ui.chkToggleMode = CreateWindowExW(0, "BUTTON"w.ptr, "Режим переключения (Toggle)"w.ptr,
+                g_ui.chkToggleMode = CreateWindowExW(0, "BUTTON"w.ptr, tr("Toggle mode", "Режим переключения (Toggle)").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_TOGGLE_MODE, hInst, null);
-                g_ui.chkOverwriteClip = CreateWindowExW(0, "BUTTON"w.ptr, "Заменять нетекстовый буфер"w.ptr,
+                g_ui.chkOverwriteClip = CreateWindowExW(0, "BUTTON"w.ptr, tr("Overwrite non-text clipboard", "Заменять нетекстовый буфер").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_OVERWRITE_CLIP, hInst, null);
 
-                g_ui.btnOpenReplacements = CreateWindowExW(0, "BUTTON"w.ptr, "Словарь замен (replacements.json)"w.ptr,
+                g_ui.btnOpenReplacements = CreateWindowExW(0, "BUTTON"w.ptr, tr("Replacements (replacements.json)", "Словарь замен (replacements.json)").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_OPEN_REPL, hInst, null);
-                g_ui.btnOpenModelsDir = CreateWindowExW(0, "BUTTON"w.ptr, "Открыть папку моделей"w.ptr,
+                g_ui.btnOpenModelsDir = CreateWindowExW(0, "BUTTON"w.ptr, tr("Open models folder", "Открыть папку моделей").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_OPEN_MODELS, hInst, null);
 
-                g_ui.lblLog = CreateWindowExW(0, "STATIC"w.ptr, "Журнал работы:"w.ptr,
+                g_ui.lblLog = CreateWindowExW(0, "STATIC"w.ptr, tr("Activity Log:", "Журнал работы:").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
-                g_ui.btnCopyLast = CreateWindowExW(0, "BUTTON"w.ptr, "Копировать фразу"w.ptr,
+                g_ui.btnCopyLast = CreateWindowExW(0, "BUTTON"w.ptr, tr("Copy Last Phrase", "Копировать фразу").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_COPY_LAST, hInst, null);
                 EnableWindow(g_ui.btnCopyLast, FALSE);
-                g_ui.btnClearLog = CreateWindowExW(0, "BUTTON"w.ptr, "Очистить"w.ptr,
+                g_ui.btnClearLog = CreateWindowExW(0, "BUTTON"w.ptr, tr("Clear", "Очистить").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_CLEAR_LOG, hInst, null);
                 g_ui.editLog = CreateWindowExW(WS_EX_CLIENTEDGE, "EDIT"w.ptr, ""w.ptr,
@@ -2008,7 +2214,7 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     g_ui.btnHide, g_ui.lblMic, g_ui.comboMic, g_ui.lblModel, g_ui.comboModel,
                     g_ui.btnBrowseModel, g_ui.lblLang, g_ui.comboLang, g_ui.lblHotkey, g_ui.btnHotkey,
                     g_ui.lblTimeout, g_ui.comboTimeout, g_ui.lblInputMode, g_ui.comboInputMode,
-                    g_ui.lblTheme, g_ui.comboTheme,
+                    g_ui.lblTheme, g_ui.comboTheme, g_ui.lblUiLang, g_ui.comboUiLang,
                     g_ui.chkAutoLoad, g_ui.chkCpuOnly,
                     g_ui.chkStartTray, g_ui.chkWinAuto, g_ui.chkLivePreview, g_ui.chkOverlay,
                     g_ui.chkToggleMode, g_ui.chkOverwriteClip,
@@ -2154,7 +2360,10 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     openModelsDir(hwnd);
                 } else if (id == ID_BTN_HOTKEY || id == ID_TRAY_HOTKEY) {
                     g_ui.capturingHotkey = true;
-                    SetWindowTextW(g_ui.btnHotkey, "Нажмите клавишу или кнопку мыши (Esc — отмена)..."w.ptr);
+                    SetWindowTextW(g_ui.btnHotkey, tr(
+                        "Press any key or mouse button (Esc to cancel)...",
+                        "Нажмите клавишу или кнопку мыши (Esc — отмена)..."
+                    ).toUTF16z());
                 } else if (id == ID_TRAY_EXIT) {
                     Shell_NotifyIconW(NIM_DELETE, &g_ui.nid);
                     DestroyWindow(hwnd);
@@ -2173,8 +2382,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyOverwriteClip(!g_ui.overwriteNonTextClip);
                 } else if (id == ID_TRAY_COPY_LAST || id == ID_BTN_COPY_LAST) {
                     if (copyTextToClipboard(g_ui.lastPhrase)) {
-                        uiLog("[CLIP] Скопирована последняя фраза: " ~ g_ui.lastPhrase);
-                        uiSetVisual(VisualState.pasted, "Скопировано в буфер", 900);
+                        uiLog(tr("[CLIP] Copied last phrase: ", "[CLIP] Скопирована последняя фраза: ") ~ g_ui.lastPhrase);
+                        uiSetVisual(VisualState.pasted, tr("Copied to clipboard", "Скопировано в буфер"), 900);
                     }
                 } else if (id == ID_TRAY_WIN_AUTO) {
                     applyWinAuto(!g_ui.winAutostart);
@@ -2191,6 +2400,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyInputModeSelection(id - ID_TRAY_INPUT_MODE_BASE);
                 } else if (id >= ID_TRAY_THEME_BASE && id < ID_TRAY_THEME_BASE + 100) {
                     applyThemeSelection(id - ID_TRAY_THEME_BASE);
+                } else if (id >= ID_TRAY_UI_LANG_BASE && id < ID_TRAY_UI_LANG_BASE + 100) {
+                    applyUiLangSelection(id - ID_TRAY_UI_LANG_BASE);
                 } else if (id == ID_COMBO_MIC && code == CBN_SELCHANGE) {
                     int sel = cast(int) SendMessageW(g_ui.comboMic, CB_GETCURSEL, 0, 0);
                     applyMicSelection(sel <= 0 ? -1 : sel - 1);
@@ -2208,6 +2419,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyInputModeSelection(cast(int) SendMessageW(g_ui.comboInputMode, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_COMBO_THEME && code == CBN_SELCHANGE) {
                     applyThemeSelection(cast(int) SendMessageW(g_ui.comboTheme, CB_GETCURSEL, 0, 0));
+                } else if (id == ID_COMBO_UI_LANG && code == CBN_SELCHANGE) {
+                    applyUiLangSelection(cast(int) SendMessageW(g_ui.comboUiLang, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_CHK_AUTOLOAD) {
                     bool checked = SendMessageW(g_ui.chkAutoLoad, BM_GETCHECK, 0, 0) == BST_CHECKED;
                     if (g_ui.onAutoLoadChange !is null) g_ui.onAutoLoadChange(checked);
@@ -2298,7 +2511,7 @@ private bool handleTriggerEvent(uint vk, bool isDownMsg, bool isUpMsg, bool isMo
                         g_ui.hotkeyName = g_ui.onHotkeyChange(vk);
                     }
                 }
-                SetWindowTextW(g_ui.btnHotkey, ("Назначить: [" ~ g_ui.hotkeyName ~ "]").toUTF16z());
+                SetWindowTextW(g_ui.btnHotkey, (tr("Assign: [", "Назначить: [") ~ g_ui.hotkeyName ~ "]").toUTF16z());
                 uiSetIdleStatus(g_ui.modelLoaded);
             }
             return true;
