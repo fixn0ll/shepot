@@ -2,13 +2,13 @@ module app;
 
 import audio : AudioCapture, listInputDevices;
 import bootstrap : downloadModel, ensureAssets;
-import config : AppConfig, loadConfig, parseHotkeyVk, resolvePath, saveConfig, vkToKeyName;
+import config : AppConfig, loadConfig, normalizeInputMode, parseHotkeyVk, resolvePath, saveConfig, vkToKeyName;
 import core.atomic : atomicLoad, atomicStore;
 import core.time : MonoTime;
-import os_win : attachParentConsoleIfAny, closeTempConsole, isWindowsAutostartEnabled,
-    openTempConsole, runTrayApp, setWindowsAutostart, showErrorBox, typeText, uiLog,
-    uiSetIdleStatus, uiSetLoadWaiting, uiSetModelState, uiSetProgress, uiSetStatus,
-    uiSetVisual, UiOption, VisualState;
+import os_win : acquireSingleInstance, attachParentConsoleIfAny, closeTempConsole,
+    isWindowsAutostartEnabled, openTempConsole, releaseSingleInstance, runTrayApp,
+    setWindowsAutostart, showErrorBox, typeText, uiLog, uiSetIdleStatus, uiSetLoadWaiting,
+    uiSetModelState, uiSetProgress, uiSetStatus, uiSetVisual, UiOption, VisualState;
 import sound : playActivationCueAsync, playClickAsync, playCueAsync;
 import std.algorithm.searching : any, canFind;
 import std.concurrency : OwnerTerminated, receive, send, spawn, Tid;
@@ -51,7 +51,24 @@ private struct SharedState {
     bool livePreview;
     bool previewBusy;
     int unloadTimeoutMin;
+    int inputModeCode; // 0 = sendinput, 1 = clipboard, 2 = auto
     ulong lastActivityMs;
+}
+
+private int encodeInputMode(string mode) nothrow {
+    if (mode == "clipboard") return 1;
+    if (mode == "auto") return 2;
+    return 0;
+}
+
+private string decodeInputMode(int code) nothrow {
+    if (code == 1) return "clipboard";
+    if (code == 2) return "auto";
+    return "sendinput";
+}
+
+private bool shouldAbortPreview() nothrow {
+    return !atomicLoad(g_state.recording);
 }
 
 private shared SharedState g_state;
@@ -278,7 +295,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(WhisperRecognizer
                             auto previewSamples = audio.peekBuffer(WHISPER_SAMPLE_RATE * 15);
                             if (!isSpeechValid(previewSamples, 0.4, cfg.rmsThreshold)) return;
 
-                            auto draft = recognizer.transcribe(previewSamples);
+                            auto draft = recognizer.transcribe(previewSamples, null, null, &shouldAbortPreview);
                             if (atomicLoad(g_state.recording) && draft.length > 0) {
                                 uiSetVisual(VisualState.recording, tailPreview(draft));
                             }
@@ -327,7 +344,8 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(WhisperRecognizer
                             }
 
                             string method;
-                            typeText(text, cfg.pasteViaClipboard, cfg.clipboardRestoreDelayMs, method);
+                            auto mode = decodeInputMode(atomicLoad(g_state.inputModeCode));
+                            typeText(text, mode, cfg.charDelayMs, cfg.clipboardRestoreDelayMs, method);
                             uiLog(format("[STT] (%.2fс, RMS=%.4f, %s): %s", dur, rms, method, text));
                             uiSetIdleStatus(true);
                             uiSetVisual(VisualState.pasted, "Вставлено: " ~ text, 1100);
@@ -356,6 +374,11 @@ version (unittest) {
 
         if (checkOnly || setupOnly) {
             attachParentConsoleIfAny();
+        } else {
+            if (!acquireSingleInstance()) return 0;
+        }
+        scope (exit) {
+            if (!checkOnly && !setupOnly) releaseSingleInstance();
         }
 
         auto cfg = loadConfig();
@@ -423,6 +446,7 @@ version (unittest) {
         atomicStore(g_state.livePreview, cfg.livePreview);
         atomicStore(g_state.previewBusy, false);
         atomicStore(g_state.unloadTimeoutMin, cfg.unloadTimeoutMin);
+        atomicStore(g_state.inputModeCode, encodeInputMode(normalizeInputMode(cfg.inputMode)));
         atomicStore(g_state.lastActivityMs, nowMs());
 
         auto hotkeyVk = parseHotkeyVk(cfg.hotkey);
@@ -448,12 +472,14 @@ version (unittest) {
         bool ok = runTrayApp(
             hotkeyVk,
             hotkeyName,
+            cfg.blockHotkey,
             mics,
             cfg.micDevice,
             modelOpts,
             cfg.modelPath,
             langOpts,
             cfg.language,
+            normalizeInputMode(cfg.inputMode),
             cfg.startMinimized,
             cfg.autoLoadModel,
             !cfg.useGpu,
@@ -541,6 +567,13 @@ version (unittest) {
                 atomicStore(g_state.lastActivityMs, nowMs());
                 saveConfig(cfg);
                 uiLog(format("[CFG] Автовыгрузка модели: %s", mins > 0 ? format("%s мин", mins) : "Никогда"));
+            },
+            (string mode) {
+                auto norm = normalizeInputMode(mode);
+                cfg.inputMode = norm;
+                atomicStore(g_state.inputModeCode, encodeInputMode(norm));
+                saveConfig(cfg);
+                uiLog("[CFG] Режим ввода: " ~ norm);
             },
             (bool checked) {
                 cfg.autoLoadModel = checked;

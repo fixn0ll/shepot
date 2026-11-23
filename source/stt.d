@@ -67,6 +67,12 @@ private extern (C) void whisperProgressTrampoline(
     fn(progress);
 }
 
+private extern (C) bool whisperAbortTrampoline(void* userData) nothrow {
+    if (userData is null) return false;
+    auto fn = cast(bool function() nothrow) userData;
+    return fn();
+}
+
 struct WhisperRecognizer {
     private WhisperApi m_api;
     private whisper_context* m_ctx;
@@ -157,7 +163,8 @@ struct WhisperRecognizer {
     string transcribe(
         const(float)[] samples,
         int* outRc = null,
-        void function(int) nothrow onProgress = null
+        void function(int) nothrow onProgress = null,
+        bool function() nothrow shouldAbort = null
     ) {
         if (m_ctx is null || samples.length == 0) return null;
 
@@ -177,6 +184,10 @@ struct WhisperRecognizer {
         if (onProgress !is null) {
             params.progress_callback = &whisperProgressTrampoline;
             params.progress_callback_user_data = cast(void*) onProgress;
+        }
+        if (shouldAbort !is null) {
+            params.abort_callback = &whisperAbortTrampoline;
+            params.abort_callback_user_data = cast(void*) shouldAbort;
         }
 
         int rc = m_api.full(m_ctx, params, samples.ptr, cast(int) samples.length);

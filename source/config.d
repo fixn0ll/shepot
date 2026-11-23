@@ -16,15 +16,24 @@ struct AppConfig {
     bool autoLoadModel = true;
     int unloadTimeoutMin = 5;
     string hotkey = "F9";
+    bool blockHotkey = true;
     int micDevice = -1;
     double minDurationSec = 0.3;
     double rmsThreshold = 0.0015;
-    bool pasteViaClipboard = true;
+    string inputMode = "sendinput";
+    int charDelayMs = 3;
     int clipboardRestoreDelayMs = 120;
     bool beep = true;
     bool showOverlay = true;
     bool livePreview = true;
     bool startMinimized = false;
+}
+
+string normalizeInputMode(string mode) {
+    import std.string : toLower;
+    auto m = mode.strip().toLower();
+    if (m == "clipboard" || m == "auto" || m == "sendinput") return m;
+    return "sendinput";
 }
 
 private struct HotkeyEntry {
@@ -111,10 +120,12 @@ string serializeConfigJson(const ref AppConfig cfg) {
     root["autoLoadModel"] = cfg.autoLoadModel;
     root["unloadTimeoutMin"] = cfg.unloadTimeoutMin;
     root["hotkey"] = cfg.hotkey;
+    root["blockHotkey"] = cfg.blockHotkey;
     root["micDevice"] = cfg.micDevice;
     root["minDurationSec"] = cfg.minDurationSec;
     root["rmsThreshold"] = cfg.rmsThreshold;
-    root["pasteViaClipboard"] = cfg.pasteViaClipboard;
+    root["inputMode"] = normalizeInputMode(cfg.inputMode);
+    root["charDelayMs"] = cfg.charDelayMs;
     root["clipboardRestoreDelayMs"] = cfg.clipboardRestoreDelayMs;
     root["beep"] = cfg.beep;
     root["showOverlay"] = cfg.showOverlay;
@@ -159,10 +170,24 @@ AppConfig parseConfigJson(string content) {
     boolean("autoLoadModel", cfg.autoLoadModel);
     integer("unloadTimeoutMin", cfg.unloadTimeoutMin);
     str("hotkey", cfg.hotkey);
+    boolean("blockHotkey", cfg.blockHotkey);
     integer("micDevice", cfg.micDevice);
     floating("minDurationSec", cfg.minDurationSec);
     floating("rmsThreshold", cfg.rmsThreshold);
-    boolean("pasteViaClipboard", cfg.pasteViaClipboard);
+
+    if (auto pMode = "inputMode" in root) {
+        if (pMode.type == JSONType.string) cfg.inputMode = normalizeInputMode(pMode.str);
+    } else {
+        bool legacyPaste = false;
+        if (auto pLegacy = "pasteViaClipboard" in root) {
+            if (pLegacy.type == JSONType.true_) cfg.inputMode = "clipboard";
+            else if (pLegacy.type == JSONType.false_) cfg.inputMode = "sendinput";
+            else if (legacyPaste) cfg.inputMode = "clipboard";
+        }
+    }
+
+    integer("charDelayMs", cfg.charDelayMs);
+    if (cfg.charDelayMs < 0) cfg.charDelayMs = 0;
     integer("clipboardRestoreDelayMs", cfg.clipboardRestoreDelayMs);
     boolean("beep", cfg.beep);
     boolean("showOverlay", cfg.showOverlay);
@@ -206,16 +231,25 @@ string vkToKeyName(uint vk) {
 }
 
 unittest {
-    auto cfg = parseConfigJson(`{"language":"en","threads":8,"useGpu":false,"autoLoadModel":false,"unloadTimeoutMin":15,"hotkey":"MOUSE4","minDurationSec":0.5}`);
+    auto cfg = parseConfigJson(`{"language":"en","threads":8,"useGpu":false,"autoLoadModel":false,"unloadTimeoutMin":15,"hotkey":"MOUSE4","blockHotkey":false,"inputMode":"auto","charDelayMs":5,"minDurationSec":0.5}`);
     assert(cfg.language == "en");
     assert(cfg.threads == 8);
     assert(!cfg.useGpu);
     assert(!cfg.autoLoadModel);
     assert(cfg.unloadTimeoutMin == 15);
     assert(cfg.hotkey == "MOUSE4");
+    assert(!cfg.blockHotkey);
+    assert(cfg.inputMode == "auto");
+    assert(cfg.charDelayMs == 5);
+
+    auto legacy = parseConfigJson(`{"pasteViaClipboard":true,"charDelayMs":-2}`);
+    assert(legacy.inputMode == "clipboard");
+    assert(legacy.charDelayMs == 0);
+    assert(legacy.blockHotkey);
 
     auto rt = parseConfigJson(serializeConfigJson(cfg));
     assert(!rt.autoLoadModel && rt.unloadTimeoutMin == 15 && rt.hotkey == "MOUSE4");
+    assert(!rt.blockHotkey && rt.inputMode == "auto" && rt.charDelayMs == 5);
 
     assert(parseHotkeyVk("F9") == 0x78);
     assert(parseHotkeyVk("mouse4") == 0x05);

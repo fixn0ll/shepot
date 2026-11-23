@@ -5,12 +5,13 @@ import core.stdc.string : memcpy;
 import core.sync.mutex : Mutex;
 import core.sys.windows.commctrl;
 import core.sys.windows.shellapi;
-import core.sys.windows.winbase : GetModuleHandleW, GlobalAlloc,
-    GlobalLock, GlobalUnlock, GMEM_MOVEABLE;
+import core.sys.windows.winbase : CloseHandle, CreateMutexW, GetLastError, GetModuleHandleW,
+    GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE;
 import core.sys.windows.wincon : AllocConsole, ATTACH_PARENT_PROCESS, AttachConsole,
     FreeConsole, SetConsoleCP, SetConsoleOutputCP;
 import core.sys.windows.windef : BYTE, COLORREF, DWORD, ERROR_SUCCESS, FALSE, HBITMAP, HBRUSH, HDC, HFONT,
     HGLOBAL, HHOOK, HICON, HKEY, HMENU, HRGN, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, UINT, WORD, WPARAM;
+import core.sys.windows.winerror : ERROR_ALREADY_EXISTS;
 import core.sys.windows.wingdi;
 import core.sys.windows.winnt : HANDLE, KEY_READ, KEY_WRITE;
 import core.sys.windows.winreg : HKEY_CURRENT_USER, REG_SZ, RegCloseKey, RegDeleteValueW,
@@ -23,6 +24,7 @@ import std.algorithm : max, min;
 import std.file : thisExePath;
 import std.format : format;
 import std.math : fabs, sqrt;
+import std.range : walkLength;
 import std.utf : toUTF16, toUTF16z;
 
 private enum uint WM_APP_TRAY = WM_APP + 1;
@@ -43,6 +45,7 @@ private enum int ID_CHK_WIN_AUTO = 112;
 private enum int ID_CHK_LIVE_PREVIEW = 113;
 private enum int ID_CHK_OVERLAY = 114;
 private enum int ID_EDIT_LOG = 115;
+private enum int ID_COMBO_INPUT_MODE = 116;
 
 private enum int ID_TRAY_TOGGLE = 201;
 private enum int ID_TRAY_EXIT = 202;
@@ -58,6 +61,7 @@ private enum int ID_TRAY_MIC_BASE = 1000;
 private enum int ID_TRAY_MODEL_BASE = 2000;
 private enum int ID_TRAY_LANG_BASE = 3000;
 private enum int ID_TRAY_TIMEOUT_BASE = 4000;
+private enum int ID_TRAY_INPUT_MODE_BASE = 5000;
 
 private enum size_t ID_TIMER_IDLE = 1;
 private enum size_t ID_TIMER_CLICK = 2;
@@ -94,11 +98,18 @@ static immutable TimeoutOption[] timeoutOptions = [
     TimeoutOption("Никогда", 0),
 ];
 
+static immutable UiOption[] inputModeOptions = [
+    UiOption("Посимвольно (игры / SendInput)", "sendinput"),
+    UiOption("Буфер обмена (Ctrl+V)", "clipboard"),
+    UiOption("Авто (<=80 симв. — посимвольно)", "auto"),
+];
+
 private struct AppUiState {
     HHOOK kbdHook;
     HHOOK mouseHook;
     uint hotkeyVk;
     string hotkeyName;
+    bool blockHotkey = true;
     bool isDown;
     bool capturingHotkey;
 
@@ -111,6 +122,7 @@ private struct AppUiState {
     UiOption[] langOptions;
     string currentLang;
     int currentTimeoutMin;
+    string currentInputMode = "sendinput";
     bool cpuOnly;
     bool beepEnabled;
     bool livePreview;
@@ -124,6 +136,7 @@ private struct AppUiState {
     string delegate(uint) onHotkeyChange;
     void delegate() onModelToggle;
     void delegate(int) onTimeoutChange;
+    void delegate(string) onInputModeChange;
     void delegate(bool) onAutoLoadChange;
     void delegate(bool) onCpuOnlyChange;
     void delegate(bool) onBeepChange;
@@ -149,6 +162,8 @@ private struct AppUiState {
     HWND btnHotkey;
     HWND lblTimeout;
     HWND comboTimeout;
+    HWND lblInputMode;
+    HWND comboInputMode;
     HWND chkAutoLoad;
     HWND chkCpuOnly;
     HWND chkStartTray;
@@ -191,6 +206,34 @@ private struct AppUiState {
 }
 
 private __gshared AppUiState g_ui;
+private __gshared HANDLE g_singleInstanceMutex = null;
+
+/// Гарантирует запуск единственного экземпляра приложения; при наличии уже запущенного — разворачивает его окно.
+bool acquireSingleInstance() {
+    if (g_singleInstanceMutex !is null) return true;
+    HANDLE h = CreateMutexW(null, FALSE, "Local\\ShepotSingleInstanceMutex"w.ptr);
+    if (h is null) return true;
+
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(h);
+        HWND existing = FindWindowW("ShepotWindowClass"w.ptr, null);
+        if (existing !is null) {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+        }
+        return false;
+    }
+
+    g_singleInstanceMutex = h;
+    return true;
+}
+
+void releaseSingleInstance() {
+    if (g_singleInstanceMutex !is null) {
+        CloseHandle(g_singleInstanceMutex);
+        g_singleInstanceMutex = null;
+    }
+}
 
 /// Подключает родительскую консоль (для CLI-режима --check / --setup).
 void attachParentConsoleIfAny() {
@@ -255,17 +298,30 @@ bool setWindowsAutostart(bool enable) {
     return RegSetValueExW(hKey, RUN_REG_VALUE.ptr, 0, REG_SZ, cast(const(ubyte)*) z.ptr, bytes) == ERROR_SUCCESS;
 }
 
-bool typeText(string text, bool viaClipboard, int restoreDelayMs, out string methodUsed) {
+bool typeText(string text, string inputMode, int charDelayMs, int restoreDelayMs, out string methodUsed) {
     if (text.length == 0) {
         methodUsed = "empty";
         return false;
     }
 
-    if (viaClipboard && pasteViaClipboard(text, restoreDelayMs)) {
-        methodUsed = "clipboard+Ctrl+V";
+    bool useClipboard = false;
+    if (inputMode == "clipboard") {
+        useClipboard = true;
+    } else if (inputMode == "auto") {
+        useClipboard = walkLength(text) > 80;
+    }
+
+    if (useClipboard) {
+        if (pasteViaClipboard(text, restoreDelayMs)) {
+            methodUsed = "clipboard+Ctrl+V";
+            return true;
+        }
+        typeUnicodeDirect(text, charDelayMs);
+        methodUsed = "SendInput(UNICODE, fallback)";
         return true;
     }
-    typeUnicodeDirect(text);
+
+    typeUnicodeDirect(text, charDelayMs);
     methodUsed = "SendInput(UNICODE)";
     return true;
 }
@@ -284,7 +340,14 @@ private bool pasteViaClipboard(string text, int restoreDelayMs) {
 
     if (!openClipboardRetry()) return false;
 
-    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+    bool hasText = IsClipboardFormatAvailable(CF_UNICODETEXT) != 0;
+    if (!hasText && CountClipboardFormats() > 0) {
+        // В буфере картинка, файлы или другие данные — не затираем буфер обмена.
+        CloseClipboard();
+        return false;
+    }
+
+    if (hasText) {
         auto hPrev = GetClipboardData(CF_UNICODETEXT);
         if (hPrev !is null) {
             auto pPrev = cast(const(wchar)*) GlobalLock(hPrev);
@@ -357,22 +420,54 @@ private void sendCtrlV() {
     SendInput(4, inputs.ptr, INPUT.sizeof);
 }
 
-private void typeUnicodeDirect(string text) {
+private void sendReturnKey() {
+    WORD scRet = cast(WORD) MapVirtualKeyW(VK_RETURN, 0);
+    INPUT[2] inputs;
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_RETURN;
+    inputs[0].ki.wScan = scRet;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_RETURN;
+    inputs[1].ki.wScan = scRet;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SendInput(2, inputs.ptr, INPUT.sizeof);
+}
+
+private void typeUnicodeDirect(string text, int charDelayMs) {
     auto utf16 = toUTF16(text);
     if (utf16.length == 0) return;
 
-    auto inputs = new INPUT[utf16.length * 2];
-    foreach (i, wchar ch; utf16) {
-        size_t idx = i * 2;
-        inputs[idx].type = INPUT_KEYBOARD;
-        inputs[idx].ki.wScan = ch;
-        inputs[idx].ki.dwFlags = KEYEVENTF_UNICODE;
+    int delay = charDelayMs < 0 ? 0 : charDelayMs;
+    size_t i = 0;
+    while (i < utf16.length) {
+        wchar ch = utf16[i];
+        if (ch == '\r') {
+            if (i + 1 < utf16.length && utf16[i + 1] == '\n') {
+                ++i;
+            }
+            sendReturnKey();
+        } else if (ch == '\n') {
+            sendReturnKey();
+        } else {
+            INPUT[2] inputs;
+            inputs[0].type = INPUT_KEYBOARD;
+            inputs[0].ki.wScan = ch;
+            inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
 
-        inputs[idx + 1].type = INPUT_KEYBOARD;
-        inputs[idx + 1].ki.wScan = ch;
-        inputs[idx + 1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+            inputs[1].type = INPUT_KEYBOARD;
+            inputs[1].ki.wScan = ch;
+            inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+            SendInput(2, inputs.ptr, INPUT.sizeof);
+        }
+
+        ++i;
+        if (delay > 0 && i < utf16.length) {
+            Thread.sleep(msecs(delay));
+        }
     }
-    SendInput(cast(uint) inputs.length, inputs.ptr, INPUT.sizeof);
 }
 
 void uiSetStatus(string status) {
@@ -447,12 +542,14 @@ void uiLog(string line) {
 bool runTrayApp(
     uint hotkeyVk,
     string hotkeyName,
+    bool blockHotkey,
     string[] micNames,
     int initialMic,
     UiOption[] modelOptions,
     string initialModel,
     UiOption[] langOptions,
     string initialLang,
+    string initialInputMode,
     bool startMinimized,
     bool autoLoad,
     bool cpuOnly,
@@ -472,6 +569,7 @@ bool runTrayApp(
     string delegate(uint) onHotkeyChange,
     void delegate() onModelToggle,
     void delegate(int) onTimeoutChange,
+    void delegate(string) onInputModeChange,
     void delegate(bool) onAutoLoadChange,
     void delegate(bool) onCpuOnlyChange,
     void delegate(bool) onBeepChange,
@@ -490,6 +588,7 @@ bool runTrayApp(
     g_ui.mtx = new Mutex();
     g_ui.hotkeyVk = hotkeyVk;
     g_ui.hotkeyName = hotkeyName;
+    g_ui.blockHotkey = blockHotkey;
     g_ui.isDown = false;
     g_ui.capturingHotkey = false;
     g_ui.modelLoaded = initialLoaded;
@@ -501,6 +600,7 @@ bool runTrayApp(
     g_ui.langOptions = langOptions;
     g_ui.currentLang = initialLang;
     g_ui.currentTimeoutMin = initialTimeoutMin;
+    g_ui.currentInputMode = initialInputMode.length ? initialInputMode : "sendinput";
     g_ui.cpuOnly = cpuOnly;
     g_ui.beepEnabled = beepEnabled;
     g_ui.livePreview = livePreview;
@@ -515,6 +615,7 @@ bool runTrayApp(
     g_ui.onHotkeyChange = onHotkeyChange;
     g_ui.onModelToggle = onModelToggle;
     g_ui.onTimeoutChange = onTimeoutChange;
+    g_ui.onInputModeChange = onInputModeChange;
     g_ui.onAutoLoadChange = onAutoLoadChange;
     g_ui.onCpuOnlyChange = onCpuOnlyChange;
     g_ui.onBeepChange = onBeepChange;
@@ -561,7 +662,7 @@ bool runTrayApp(
         clsName,
         "Shepot — Голосовой ввод"w.ptr,
         style,
-        CW_USEDEFAULT, CW_USEDEFAULT, 600, 595,
+        CW_USEDEFAULT, CW_USEDEFAULT, 600, 630,
         null, null, hInst, null
     );
     if (g_ui.hwnd is null) return false;
@@ -575,6 +676,7 @@ bool runTrayApp(
     populateOptionCombo(g_ui.comboModel, modelOptions, initialModel);
     populateOptionCombo(g_ui.comboLang, langOptions, initialLang);
     populateTimeoutCombo(initialTimeoutMin);
+    populateOptionCombo(g_ui.comboInputMode, cast(UiOption[]) inputModeOptions, g_ui.currentInputMode);
 
     SendMessageW(g_ui.chkAutoLoad, BM_SETCHECK, autoLoad ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_ui.chkCpuOnly, BM_SETCHECK, cpuOnly ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -799,6 +901,10 @@ private void layoutChildren(int w, int h) {
     MoveWindow(g_ui.comboTimeout, pad + labelW + 8, y, ctrlW, 220, TRUE);
 
     y += 32;
+    MoveWindow(g_ui.lblInputMode, pad, y + 4, labelW, 20, TRUE);
+    MoveWindow(g_ui.comboInputMode, pad + labelW + 8, y, ctrlW, 220, TRUE);
+
+    y += 32;
     int halfW = (w - pad * 3) / 2;
     MoveWindow(g_ui.chkAutoLoad, pad, y, halfW, 22, TRUE);
     MoveWindow(g_ui.chkCpuOnly, pad * 2 + halfW, y, halfW, 22, TRUE);
@@ -896,6 +1002,14 @@ private void showTrayMenu(HWND hwnd) {
         AppendMenuW(subTimeout, fl, ID_TRAY_TIMEOUT_BASE + i, opt.label.toUTF16z());
     }
     AppendMenuW(menu, MF_POPUP, cast(size_t) subTimeout, "Автовыгрузка (VRAM)"w.ptr);
+
+    // Подменю режима ввода
+    HMENU subInputMode = CreatePopupMenu();
+    foreach (i, opt; inputModeOptions) {
+        UINT fl = MF_STRING | (opt.value == g_ui.currentInputMode ? MF_CHECKED : MF_UNCHECKED);
+        AppendMenuW(subInputMode, fl, ID_TRAY_INPUT_MODE_BASE + i, opt.label.toUTF16z());
+    }
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subInputMode, "Режим ввода"w.ptr);
 
     AppendMenuW(menu, MF_STRING, ID_TRAY_HOTKEY,
         ("Назначить клавишу [" ~ g_ui.hotkeyName ~ "]").toUTF16z());
@@ -1125,6 +1239,13 @@ private void applyTimeoutSelection(int idx) {
     if (g_ui.onTimeoutChange !is null) g_ui.onTimeoutChange(g_ui.currentTimeoutMin);
 }
 
+private void applyInputModeSelection(int idx) {
+    if (idx < 0 || idx >= cast(int) inputModeOptions.length) return;
+    g_ui.currentInputMode = inputModeOptions[idx].value;
+    SendMessageW(g_ui.comboInputMode, CB_SETCURSEL, idx, 0);
+    if (g_ui.onInputModeChange !is null) g_ui.onInputModeChange(g_ui.currentInputMode);
+}
+
 private void applyCpuOnly(bool checked) {
     g_ui.cpuOnly = checked;
     SendMessageW(g_ui.chkCpuOnly, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1203,6 +1324,12 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_TIMEOUT, hInst, null);
 
+                g_ui.lblInputMode = CreateWindowExW(0, "STATIC"w.ptr, "Режим ввода:"w.ptr,
+                    WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
+                g_ui.comboInputMode = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
+                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_COMBO_INPUT_MODE, hInst, null);
+
                 g_ui.chkAutoLoad = CreateWindowExW(0, "BUTTON"w.ptr, "Автозагрузка модели"w.ptr,
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_AUTOLOAD, hInst, null);
@@ -1233,7 +1360,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 foreach (ctrl; [
                     g_ui.btnHide, g_ui.lblMic, g_ui.comboMic, g_ui.lblModel, g_ui.comboModel,
                     g_ui.lblLang, g_ui.comboLang, g_ui.lblHotkey, g_ui.btnHotkey,
-                    g_ui.lblTimeout, g_ui.comboTimeout, g_ui.chkAutoLoad, g_ui.chkCpuOnly,
+                    g_ui.lblTimeout, g_ui.comboTimeout, g_ui.lblInputMode, g_ui.comboInputMode,
+                    g_ui.chkAutoLoad, g_ui.chkCpuOnly,
                     g_ui.chkStartTray, g_ui.chkWinAuto, g_ui.chkLivePreview, g_ui.chkOverlay, g_ui.lblLog
                 ]) {
                     SendMessageW(ctrl, WM_SETFONT, cast(WPARAM) g_ui.fontUi, TRUE);
@@ -1263,7 +1391,7 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
             case WM_GETMINMAXINFO:
                 auto mmi = cast(MINMAXINFO*) lParam;
                 mmi.ptMinTrackSize.x = 520;
-                mmi.ptMinTrackSize.y = 510;
+                mmi.ptMinTrackSize.y = 545;
                 return 0;
 
             case WM_SIZE:
@@ -1323,8 +1451,10 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyModelSelection(id - ID_TRAY_MODEL_BASE);
                 } else if (id >= ID_TRAY_LANG_BASE && id < ID_TRAY_TIMEOUT_BASE) {
                     applyLangSelection(id - ID_TRAY_LANG_BASE);
-                } else if (id >= ID_TRAY_TIMEOUT_BASE && id < ID_TRAY_TIMEOUT_BASE + 100) {
+                } else if (id >= ID_TRAY_TIMEOUT_BASE && id < ID_TRAY_INPUT_MODE_BASE) {
                     applyTimeoutSelection(id - ID_TRAY_TIMEOUT_BASE);
+                } else if (id >= ID_TRAY_INPUT_MODE_BASE && id < ID_TRAY_INPUT_MODE_BASE + 100) {
+                    applyInputModeSelection(id - ID_TRAY_INPUT_MODE_BASE);
                 } else if (id == ID_COMBO_MIC && code == CBN_SELCHANGE) {
                     int sel = cast(int) SendMessageW(g_ui.comboMic, CB_GETCURSEL, 0, 0);
                     applyMicSelection(sel <= 0 ? -1 : sel - 1);
@@ -1334,6 +1464,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyLangSelection(cast(int) SendMessageW(g_ui.comboLang, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_COMBO_TIMEOUT && code == CBN_SELCHANGE) {
                     applyTimeoutSelection(cast(int) SendMessageW(g_ui.comboTimeout, CB_GETCURSEL, 0, 0));
+                } else if (id == ID_COMBO_INPUT_MODE && code == CBN_SELCHANGE) {
+                    applyInputModeSelection(cast(int) SendMessageW(g_ui.comboInputMode, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_CHK_AUTOLOAD) {
                     bool checked = SendMessageW(g_ui.chkAutoLoad, BM_GETCHECK, 0, 0) == BST_CHECKED;
                     if (g_ui.onAutoLoadChange !is null) g_ui.onAutoLoadChange(checked);
@@ -1419,7 +1551,7 @@ private bool handleTriggerEvent(uint vk, bool isDownMsg, bool isUpMsg, bool isMo
                 g_ui.isDown = false;
                 if (g_ui.onStop !is null) g_ui.onStop();
             }
-            return isMouse;
+            return isMouse || g_ui.blockHotkey;
         }
     } catch (Throwable) {
     }
