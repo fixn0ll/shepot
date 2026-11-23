@@ -2,7 +2,8 @@ module app;
 
 import audio : AudioCapture, listInputDevices;
 import bootstrap : downloadModel, ensureAssets;
-import config : AppConfig, loadConfig, normalizeInputMode, parseHotkeyVk, resolvePath, saveConfig, vkToKeyName;
+import config : AppConfig, loadConfig, normalizeEngine, normalizeInputMode, parseHotkeyVk,
+    resolvePath, saveConfig, vkToKeyName;
 import core.atomic : atomicLoad, atomicStore;
 import core.time : MonoTime;
 import os_win : acquireSingleInstance, attachParentConsoleIfAny, closeTempConsole,
@@ -18,8 +19,16 @@ import std.file : exists;
 import std.format : format;
 import std.path : baseName;
 import std.stdio : writeln, writefln;
-import stt : calcRms, isSpeechValid, tailPreview, WhisperRecognizer;
-import whisper_c : WHISPER_SAMPLE_RATE;
+import stt : WhisperRecognizer;
+import stt_engine : calcRms, isSpeechValid, SAMPLE_RATE, SttEngine, tailPreview;
+import stt_sherpa : SherpaRecognizer;
+
+SttEngine createSttEngine(const ref AppConfig cfg) {
+    if (normalizeEngine(cfg.engine) == "sherpa") {
+        return new SherpaRecognizer();
+    }
+    return new WhisperRecognizer();
+}
 
 private enum WorkerCmd {
     loadModel,
@@ -148,7 +157,7 @@ private bool ensureModelDownloadedUi(string modelRelPath) {
     return true;
 }
 
-private bool ensureModelLoaded(WhisperRecognizer* recognizer, bool notifyCue) {
+private bool ensureModelLoaded(SttEngine recognizer, bool notifyCue) {
     if (recognizer.isLoaded()) {
         atomicStore(g_state.modelLoaded, true);
         atomicStore(g_state.modelLoading, false);
@@ -160,7 +169,7 @@ private bool ensureModelLoaded(WhisperRecognizer* recognizer, bool notifyCue) {
     atomicStore(g_state.modelLoading, true);
     uiSetModelState(false, true);
 
-    if (!exists(recognizer.modelPath())) {
+    if (recognizer.supportsRemoteDownload() && !exists(recognizer.modelPath())) {
         if (!ensureModelDownloadedUi(recognizer.modelPath())) {
             atomicStore(g_state.modelLoading, false);
             uiSetLoadWaiting(false);
@@ -188,15 +197,15 @@ private bool ensureModelLoaded(WhisperRecognizer* recognizer, bool notifyCue) {
     atomicStore(g_state.modelLoaded, true);
     atomicStore(g_state.lastActivityMs, nowMs());
     uiSetModelState(true, false);
-    uiLog(format("[MDL] Модель %s загружена (%s) и прогрета.",
-        baseName(recognizer.modelPath()), recognizer.useGpu() ? "GPU Vulkan" : "CPU"));
+    auto mName = recognizer.modelPath().length ? baseName(recognizer.modelPath()) : recognizer.engineVersion();
+    uiLog(format("[MDL] Модель %s загружена (%s).", mName, recognizer.useGpu() ? "GPU" : "CPU"));
     if (notifyCue && atomicLoad(g_state.beepEnabled)) {
         playActivationCueAsync();
     }
     return true;
 }
 
-private void unloadModelNow(WhisperRecognizer* recognizer, string reason) {
+private void unloadModelNow(SttEngine recognizer, string reason) {
     if (!recognizer.isLoaded()) return;
     recognizer.unloadModel();
     atomicStore(g_state.modelLoaded, false);
@@ -206,9 +215,9 @@ private void unloadModelNow(WhisperRecognizer* recognizer, string reason) {
     uiSetIdleStatus(false);
 }
 
-private void workerLoop(shared(AudioCapture)* audioPtr, shared(WhisperRecognizer)* sttPtr, immutable AppConfig cfg) {
+private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPtr, immutable AppConfig cfg) {
     auto audio = cast(AudioCapture*) audioPtr;
-    auto recognizer = cast(WhisperRecognizer*) sttPtr;
+    auto recognizer = *cast(SttEngine*) sttPtr;
     ReplacementStore replacements;
 
     if (cfg.autoLoadModel) {
@@ -295,7 +304,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(WhisperRecognizer
                             scope (exit) atomicStore(g_state.previewBusy, false);
                             if (!atomicLoad(g_state.recording) || !recognizer.isLoaded()) return;
 
-                            auto previewSamples = audio.peekBuffer(WHISPER_SAMPLE_RATE * 15);
+                            auto previewSamples = audio.peekBuffer(SAMPLE_RATE * 15);
                             if (!isSpeechValid(previewSamples, 0.4, cfg.rmsThreshold)) return;
 
                             auto draft = recognizer.transcribe(previewSamples, null, null, &shouldAbortPreview);
@@ -306,7 +315,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(WhisperRecognizer
 
                         case WorkerCmd.transcribe:
                             auto samples = audio.stopAndTakeBuffer();
-                            double dur = cast(double) samples.length / WHISPER_SAMPLE_RATE;
+                            double dur = cast(double) samples.length / SAMPLE_RATE;
                             double rms = calcRms(samples);
 
                             if (!recognizer.isLoaded()) {
@@ -334,7 +343,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(WhisperRecognizer
                             atomicStore(g_state.lastActivityMs, nowMs());
 
                             if (rc != 0) {
-                                uiLog(format("[ОШИБКА] whisper_full вернул код %s", rc));
+                                uiLog(format("[ОШИБКА] Распознаватель вернул код %s", rc));
                                 uiSetIdleStatus(true);
                                 uiSetVisual(VisualState.idle, "Ошибка распознавания", 1200);
                                 return;
@@ -393,7 +402,8 @@ version (unittest) {
         }
 
         auto cfg = loadConfig();
-        bool needTempConsole = !checkOnly && !setupOnly && allowDownload &&
+        bool isWhisper = normalizeEngine(cfg.engine) == "whisper";
+        bool needTempConsole = isWhisper && !checkOnly && !setupOnly && allowDownload &&
             (!exists(resolvePath(cfg.whisperDll)) || !exists(resolvePath(cfg.modelPath)));
         if (needTempConsole) openTempConsole();
 
@@ -401,7 +411,9 @@ version (unittest) {
         if (needTempConsole) closeTempConsole();
 
         if (!assetsOk) {
-            auto msg = "Не хватает зависимостей. Запустите с --setup или положите whisper.dll и модель в bin/.";
+            auto msg = isWhisper
+                ? "Не хватает зависимостей. Запустите с --setup или положите whisper.dll и модель в bin/."
+                : "Не найдена sherpa-onnx-c-api.dll (проверьте sherpaDll в config.json).";
             if (checkOnly || setupOnly) writeln(msg);
             else showErrorBox(msg);
             return 1;
@@ -412,8 +424,8 @@ version (unittest) {
         }
 
         string err;
-        WhisperRecognizer recognizer;
-        if (checkOnly) writefln("Инициализация Whisper (%s)...", cfg.modelPath);
+        SttEngine recognizer = createSttEngine(cfg);
+        if (checkOnly) writefln("Инициализация %s (%s)...", normalizeEngine(cfg.engine), recognizer.modelPath());
         if (!recognizer.initApi(cfg, err)) {
             if (checkOnly) writeln("Ошибка: ", err);
             else showErrorBox(err);
@@ -440,12 +452,12 @@ version (unittest) {
         if (checkOnly) {
             import core.thread : Thread;
             import core.time : msecs;
-            writefln("Whisper version=%s", recognizer.whisperVersion());
+            writefln("Engine=%s", recognizer.engineVersion());
             capture.startRecording();
             Thread.sleep(500.msecs);
             auto testBuf = capture.stopAndTakeBuffer();
             writefln("Микрофон: %s сэмплов за 500мс, RMS=%.5f", testBuf.length, calcRms(testBuf));
-            writeln("Проверка пройдена: Whisper, Vulkan/модель и микрофон инициализированы.");
+            writeln("Проверка пройдена: движок STT, модель и микрофон инициализированы.");
             return 0;
         }
 
@@ -468,12 +480,13 @@ version (unittest) {
         bool winAuto = isWindowsAutostartEnabled();
 
         immutable AppConfig immCfg = cfg;
-        Tid worker = spawn(&workerLoop, cast(shared(AudioCapture)*) &capture, cast(shared(WhisperRecognizer)*) &recognizer, immCfg);
+        Tid worker = spawn(&workerLoop, cast(shared(AudioCapture)*) &capture, cast(shared(SttEngine)*) &recognizer, immCfg);
         scope (exit) worker.send(WorkerCmd.shutdown);
 
+        auto activeModelName = recognizer.modelPath().length ? baseName(recognizer.modelPath()) : cfg.sherpaModelType;
         string[] initLogs = [
-            format("Whisper %s готов (%s, режим: %s)",
-                recognizer.whisperVersion(), baseName(cfg.modelPath), cfg.useGpu ? "GPU Vulkan" : "CPU"),
+            format("%s готов (%s, режим: %s)",
+                recognizer.engineVersion(), activeModelName, cfg.useGpu ? "GPU" : "CPU"),
             format("Активация: [%s], язык: %s, автовыгрузка: %s",
                 hotkeyName, cfg.language, cfg.unloadTimeoutMin > 0 ? format("%s мин", cfg.unloadTimeoutMin) : "Никогда"),
             format("Найдено микрофонов: %s", mics.length),

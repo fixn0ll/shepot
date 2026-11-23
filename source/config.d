@@ -8,8 +8,16 @@ import std.path : buildPath, dirName, isAbsolute;
 import std.string : strip, toUpper;
 
 struct AppConfig {
+    string engine = "whisper";
     string whisperDll = "whisper.dll";
     string modelPath = "models/ggml-large-v3-turbo-q5_0.bin";
+    string sherpaDll = "sherpa-onnx-c-api.dll";
+    string sherpaModelType = "nemo_transducer";
+    string sherpaEncoder = "";
+    string sherpaDecoder = "";
+    string sherpaJoiner = "";
+    string sherpaCtcModel = "";
+    string sherpaTokens = "";
     string language = "ru";
     int threads = 4;
     bool useGpu = true;
@@ -29,6 +37,13 @@ struct AppConfig {
     bool showOverlay = true;
     bool livePreview = true;
     bool startMinimized = false;
+}
+
+string normalizeEngine(string engine) {
+    import std.string : toLower;
+    auto e = engine.strip().toLower();
+    if (e == "sherpa" || e == "sherpa-onnx" || e == "gigaam") return "sherpa";
+    return "whisper";
 }
 
 string normalizeInputMode(string mode) {
@@ -114,8 +129,16 @@ bool saveConfig(const ref AppConfig cfg) {
 
 string serializeConfigJson(const ref AppConfig cfg) {
     JSONValue root = JSONValue.emptyObject;
+    root["engine"] = normalizeEngine(cfg.engine);
     root["whisperDll"] = cfg.whisperDll;
     root["modelPath"] = cfg.modelPath;
+    root["sherpaDll"] = cfg.sherpaDll;
+    root["sherpaModelType"] = cfg.sherpaModelType;
+    root["sherpaEncoder"] = cfg.sherpaEncoder;
+    root["sherpaDecoder"] = cfg.sherpaDecoder;
+    root["sherpaJoiner"] = cfg.sherpaJoiner;
+    root["sherpaCtcModel"] = cfg.sherpaCtcModel;
+    root["sherpaTokens"] = cfg.sherpaTokens;
     root["language"] = cfg.language;
     root["threads"] = cfg.threads;
     root["useGpu"] = cfg.useGpu;
@@ -166,8 +189,17 @@ AppConfig parseConfigJson(string content) {
         }
     }
 
+    str("engine", cfg.engine);
+    cfg.engine = normalizeEngine(cfg.engine);
     str("whisperDll", cfg.whisperDll);
     str("modelPath", cfg.modelPath);
+    str("sherpaDll", cfg.sherpaDll);
+    str("sherpaModelType", cfg.sherpaModelType);
+    str("sherpaEncoder", cfg.sherpaEncoder);
+    str("sherpaDecoder", cfg.sherpaDecoder);
+    str("sherpaJoiner", cfg.sherpaJoiner);
+    str("sherpaCtcModel", cfg.sherpaCtcModel);
+    str("sherpaTokens", cfg.sherpaTokens);
     str("language", cfg.language);
     integer("threads", cfg.threads);
     boolean("useGpu", cfg.useGpu);
@@ -269,4 +301,13 @@ unittest {
     assert(vkToKeyName(0x05) == "MOUSE4");
     assert(vkToKeyName(0x78) == "F9");
     assert(parseHotkeyVk(vkToKeyName(0xDC)) == 0xDC);
+
+    auto sh = parseConfigJson(`{"engine":"sherpa","sherpaDll":"sherpa-onnx-c-api.dll","sherpaModelType":"nemo_ctc","sherpaCtcModel":"models/gigaam.onnx","sherpaTokens":"models/tokens.txt"}`);
+    assert(sh.engine == "sherpa");
+    assert(sh.sherpaModelType == "nemo_ctc");
+    assert(sh.sherpaCtcModel == "models/gigaam.onnx");
+    assert(sh.sherpaTokens == "models/tokens.txt");
+    auto shRt = parseConfigJson(serializeConfigJson(sh));
+    assert(shRt.engine == "sherpa" && shRt.sherpaModelType == "nemo_ctc");
+    assert(shRt.sherpaCtcModel == "models/gigaam.onnx");
 }

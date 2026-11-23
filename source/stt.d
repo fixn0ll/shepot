@@ -3,58 +3,9 @@ module stt;
 import config : AppConfig, resolvePath;
 import std.array : appender;
 import std.file : exists;
-import std.math : sqrt;
-import std.string : fromStringz, strip, toLower, toStringz;
+import std.string : fromStringz, strip, toStringz;
+import stt_engine : isHallucination, SAMPLE_RATE, SttEngine;
 import whisper_c;
-
-/// Возвращает среднеквадратичную громкость (RMS) аудиосэмплов.
-double calcRms(const(float)[] samples) {
-    if (samples.length == 0) return 0.0;
-    double sum = 0.0;
-    foreach (s; samples) {
-        sum += cast(double) s * cast(double) s;
-    }
-    return sqrt(sum / samples.length);
-}
-
-/// Проверяет, проходит ли запись порог длительности и громкости.
-bool isSpeechValid(const(float)[] samples, double minDurationSec, double rmsThreshold) {
-    double duration = cast(double) samples.length / WHISPER_SAMPLE_RATE;
-    if (duration < minDurationSec) return false;
-    return calcRms(samples) >= rmsThreshold;
-}
-
-/// Отсеивает типичные галлюцинации Whisper на пустой/тихой речи.
-bool isHallucination(string text) {
-    auto t = text.strip().toLower();
-    if (t.length == 0) return true;
-
-    static immutable string[] phantoms = [
-        "субтитры создавал",
-        "субтитры делал",
-        "редактор субтитров",
-        "продолжение следует",
-        "спасибо за просмотр",
-        "подписывайтесь на канал",
-        "[музыка]",
-        "[аплодисменты]",
-        "[тишина]",
-        "(музыка)",
-        "thank you for watching",
-        "thanks for watching",
-    ];
-    foreach (p; phantoms) {
-        if (t == p || (t.length <= p.length + 24 && indexOfFast(t, p))) {
-            return true;
-        }
-    }
-    return false;
-}
-
-private bool indexOfFast(string haystack, string needle) {
-    import std.algorithm.searching : canFind;
-    return haystack.canFind(needle);
-}
 
 private extern (C) void whisperProgressTrampoline(
     whisper_context* ctx,
@@ -73,7 +24,7 @@ private extern (C) bool whisperAbortTrampoline(void* userData) nothrow {
     return fn();
 }
 
-struct WhisperRecognizer {
+class WhisperRecognizer : SttEngine {
     private WhisperApi m_api;
     private whisper_context* m_ctx;
     private string m_modelPath;
@@ -82,7 +33,7 @@ struct WhisperRecognizer {
     private int m_threads;
     private bool m_useGpu;
 
-    bool initApi(const ref AppConfig cfg, out string err) {
+    override bool initApi(const ref AppConfig cfg, out string err) {
         auto dllPath = resolvePath(cfg.whisperDll);
         if (!m_api.load(dllPath, err)) return false;
 
@@ -98,31 +49,35 @@ struct WhisperRecognizer {
         m_initialPrompt = prompt;
     }
 
-    void setModelPath(string modelRelOrAbs) {
+    override void setModelPath(string modelRelOrAbs) {
         m_modelPath = resolvePath(modelRelOrAbs);
     }
 
-    string modelPath() const {
+    override string modelPath() const {
         return m_modelPath;
     }
 
-    void setLanguage(string lang) {
+    override void setLanguage(string lang) {
         m_language = lang.length ? lang : "auto";
     }
 
-    void setUseGpu(bool useGpu) {
+    override void setUseGpu(bool useGpu) {
         m_useGpu = useGpu;
     }
 
-    bool useGpu() const {
+    override bool useGpu() const {
         return m_useGpu;
     }
 
-    bool isLoaded() const {
+    override bool isLoaded() const {
         return m_ctx !is null;
     }
 
-    bool loadModel(out string err) {
+    override bool supportsRemoteDownload() const {
+        return true;
+    }
+
+    override bool loadModel(out string err) {
         if (m_ctx !is null) return true;
         if (!exists(m_modelPath)) {
             err = "Модель не найдена: " ~ m_modelPath;
@@ -146,27 +101,28 @@ struct WhisperRecognizer {
         return true;
     }
 
-    void unloadModel() {
+    override void unloadModel() {
         if (m_ctx !is null) {
             m_api.freeContext(m_ctx);
             m_ctx = null;
         }
     }
 
-    string whisperVersion() {
-        return m_api.versionStr ? m_api.versionStr().fromStringz().idup : "unknown";
+    override string engineVersion() {
+        auto v = m_api.versionStr ? m_api.versionStr().fromStringz().idup : "unknown";
+        return "Whisper " ~ v;
     }
 
     /// Прогрев модели тишиной (убирает задержку компиляции Vulkan-шейдеров при первой диктовке).
     int warmup() {
         if (m_ctx is null) return -1;
-        float[WHISPER_SAMPLE_RATE / 2] silence = 0.0f;
+        float[SAMPLE_RATE / 2] silence = 0.0f;
         int rc = 0;
-        transcribe(silence[], &rc, null);
+        transcribe(silence[], &rc, null, null);
         return rc;
     }
 
-    string transcribe(
+    override string transcribe(
         const(float)[] samples,
         int* outRc = null,
         void function(int) nothrow onProgress = null,
@@ -217,39 +173,8 @@ struct WhisperRecognizer {
         return cleaned;
     }
 
-    void close() {
+    override void close() {
         unloadModel();
         m_api.unload();
     }
-}
-
-/// Возвращает хвост UTF-8 строки длиной не более maxChars символов.
-string tailPreview(string text, size_t maxChars = 48) {
-    import std.range : walkLength;
-    import std.utf : stride;
-    size_t total = walkLength(text);
-    if (total <= maxChars) return text;
-    size_t skip = total - (maxChars - 1);
-    size_t bytePos = 0;
-    foreach (_; 0 .. skip) {
-        bytePos += stride(text, bytePos);
-    }
-    return "…" ~ text[bytePos .. $];
-}
-
-unittest {
-    float[4000] quiet = 0.0f;
-    assert(!isSpeechValid(quiet[], 0.3, 0.005));
-
-    float[8000] silent = 0.0001f;
-    assert(!isSpeechValid(silent[], 0.3, 0.005));
-
-    float[8000] loud = 0.05f;
-    assert(isSpeechValid(loud[], 0.3, 0.005));
-
-    assert(isHallucination("  Субтитры создавал DimaTorzok  "));
-    assert(isHallucination("[Музыка]"));
-    assert(!isHallucination("Привет, это тест диктовки."));
-    assert(tailPreview("Привет", 10) == "Привет");
-    assert(tailPreview("Привет, мир!", 5) == "…мир!");
 }

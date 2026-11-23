@@ -1,6 +1,6 @@
 module bootstrap;
 
-import config : AppConfig, resolvePath;
+import config : AppConfig, normalizeEngine, resolvePath;
 import std.algorithm.searching : endsWith, startsWith;
 import std.conv : to;
 import std.file : dirEntries, exists, mkdirRecurse, remove, rename, rmdirRecurse, SpanMode;
@@ -14,8 +14,17 @@ private enum string VulkanRuntimeUrl =
 private enum string HfModelBaseUrl =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 
-/// Проверяет наличие whisper.dll и модели; при отсутствии скачивает автоматически.
+/// Проверяет наличие DLL и модели для активного движка; для Whisper при отсутствии скачивает автоматически.
 bool ensureAssets(const ref AppConfig cfg, bool allowDownload) {
+    if (normalizeEngine(cfg.engine) == "sherpa") {
+        auto dllPath = resolvePath(cfg.sherpaDll);
+        if (!exists(dllPath)) {
+            writefln("Отсутствует библиотека sherpa-onnx: %s", dllPath);
+            return false;
+        }
+        return true;
+    }
+
     auto dllPath = resolvePath(cfg.whisperDll);
     auto modelPath = resolvePath(cfg.modelPath);
 

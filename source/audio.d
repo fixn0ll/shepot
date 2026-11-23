@@ -7,7 +7,7 @@ import core.sys.windows.winbase : CRITICAL_SECTION, DeleteCriticalSection, Enter
     InitializeCriticalSection, LeaveCriticalSection;
 import core.sys.windows.windef : DWORD, DWORD_PTR, UINT;
 import std.utf : toUTF8;
-import whisper_c : WHISPER_SAMPLE_RATE;
+import stt_engine : SAMPLE_RATE;
 
 /// Возвращает список доступных микрофонов Windows (индексы 0..N-1).
 string[] listInputDevices() {
@@ -32,7 +32,7 @@ struct AudioCapture {
     private enum int NumBuffers = 4;
     private enum int SamplesPerChunk = 800; // 50 мс при 16 кГц
     private enum int BytesPerChunk = SamplesPerChunk * short.sizeof;
-    private enum size_t InitialCapSamples = WHISPER_SAMPLE_RATE * 16; // 16 сек (~64 КБ)
+    private enum size_t InitialCapSamples = SAMPLE_RATE * 16; // 16 сек (~64 КБ)
 
     private HWAVEIN m_handle;
     private WAVEHDR[NumBuffers] m_headers;
@@ -63,7 +63,7 @@ struct AudioCapture {
         WAVEFORMATEX fmt;
         fmt.wFormatTag = WAVE_FORMAT_PCM;
         fmt.nChannels = 1;
-        fmt.nSamplesPerSec = WHISPER_SAMPLE_RATE;
+        fmt.nSamplesPerSec = SAMPLE_RATE;
         fmt.wBitsPerSample = 16;
         fmt.nBlockAlign = cast(ushort)(fmt.nChannels * (fmt.wBitsPerSample / 8));
         fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign;
