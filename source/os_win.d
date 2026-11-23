@@ -10,8 +10,8 @@ import core.sys.windows.shellapi;
 import core.sys.windows.winbase : CloseHandle, CreateMutexW, FreeLibrary, GetFileType, GetLastError,
     GetModuleHandleW, GetProcAddress, GetStdHandle, GlobalAlloc, GlobalLock, GlobalUnlock,
     GMEM_MOVEABLE, LoadLibraryW, STD_OUTPUT_HANDLE;
-import core.sys.windows.wincon : AllocConsole, ATTACH_PARENT_PROCESS, AttachConsole,
-    FreeConsole, SetConsoleCP, SetConsoleOutputCP;
+import core.sys.windows.wincon : ATTACH_PARENT_PROCESS, AttachConsole,
+    SetConsoleCP, SetConsoleOutputCP;
 import core.sys.windows.basetsd : LONG_PTR, UINT_PTR;
 import core.sys.windows.windef : BOOL, BYTE, COLORREF, DWORD, ERROR_SUCCESS, FALSE, HBITMAP, HBRUSH,
     HDC, HFONT, HGLOBAL, HHOOK, HICON, HKEY, HMENU, HMODULE, HPEN, HRGN, HRESULT, HWND, LPARAM,
@@ -335,21 +335,6 @@ void attachParentConsoleIfAny() {
     enum uint CP_UTF8 = 65001;
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
-}
-
-/// Открывает временную консоль для отображения прогресса curl при первом старте.
-void openTempConsole() {
-    if (AllocConsole()) {
-        freopen("CONOUT$", "w", stdout);
-        freopen("CONOUT$", "w", stderr);
-        enum uint CP_UTF8 = 65001;
-        SetConsoleOutputCP(CP_UTF8);
-        SetConsoleCP(CP_UTF8);
-    }
-}
-
-void closeTempConsole() {
-    FreeConsole();
 }
 
 void showErrorBox(string msg) {

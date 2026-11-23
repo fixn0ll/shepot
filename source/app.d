@@ -9,8 +9,8 @@ import config : AppConfig, applyModelPreset, builtinModelPresets, detectCustomMo
 import core.atomic : atomicLoad, atomicStore;
 import core.time : MonoTime;
 import i18n : normalizeUiLanguage, setUiLanguage, tr;
-import os_win : acquireSingleInstance, attachParentConsoleIfAny, closeTempConsole,
-    isWindowsAutostartEnabled, openTempConsole, releaseSingleInstance, runTrayApp,
+import os_win : acquireSingleInstance, attachParentConsoleIfAny,
+    isWindowsAutostartEnabled, releaseSingleInstance, runTrayApp,
     setWindowsAutostart, showErrorBox, typeText, uiLog, uiRefreshLanguage, uiSetGpuAvailable,
     uiSetIdleStatus, uiSetLangOptions, uiSetLastPhrase, uiSetLoadWaiting, uiSetModelOptions,
     uiSetModelState, uiSetProgress, uiSetStatus, uiSetVisual, UiOption, VisualState;
@@ -199,8 +199,25 @@ private bool ensureModelDownloadedUi(const ref AppConfig curCfg) {
     return true;
 }
 
-private bool ensureModelLoaded(SttEngine recognizer, const ref AppConfig curCfg, bool notifyCue) {
-    if (recognizer.isLoaded()) {
+private bool ensureEngineReady(ref SttEngine recognizer, const ref AppConfig curCfg) {
+    if (recognizer !is null) return true;
+    if (!ensureRuntimeUi(curCfg)) return false;
+
+    auto nextRec = createSttEngine(curCfg);
+    string initErr;
+    if (!nextRec.initApi(curCfg, initErr)) {
+        uiLog(tr("[ERROR] ", "[ОШИБКА] ") ~ initErr);
+        uiSetModelState(false, false);
+        uiSetIdleStatus(false);
+        return false;
+    }
+    recognizer = nextRec;
+    uiSetGpuAvailable(recognizer.supportsGpu());
+    return true;
+}
+
+private bool ensureModelLoaded(ref SttEngine recognizer, const ref AppConfig curCfg, bool notifyCue) {
+    if (recognizer !is null && recognizer.isLoaded()) {
         atomicStore(g_state.modelLoaded, true);
         atomicStore(g_state.modelLoading, false);
         uiSetLoadWaiting(false);
@@ -211,7 +228,7 @@ private bool ensureModelLoaded(SttEngine recognizer, const ref AppConfig curCfg,
     atomicStore(g_state.modelLoading, true);
     uiSetModelState(false, true);
 
-    if (!ensureRuntimeUi(curCfg) || !ensureModelDownloadedUi(curCfg)) {
+    if (!ensureEngineReady(recognizer, curCfg) || !ensureModelDownloadedUi(curCfg)) {
         atomicStore(g_state.modelLoading, false);
         uiSetLoadWaiting(false);
         return false;
@@ -287,20 +304,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                     uiSetModelState(false, false);
 
                     curCfg = msg.cfg;
-                    if (!ensureRuntimeUi(curCfg)) {
-                        uiSetIdleStatus(false);
-                        return;
-                    }
-
-                    auto nextRec = createSttEngine(curCfg);
-                    string initErr;
-                    if (!nextRec.initApi(curCfg, initErr)) {
-                        uiLog(tr("[ERROR] ", "[ОШИБКА] ") ~ initErr);
-                        uiSetIdleStatus(false);
-                        return;
-                    }
-                    recognizer = nextRec;
-                    uiSetGpuAvailable(recognizer.supportsGpu());
+                    if (!ensureEngineReady(recognizer, curCfg)) return;
 
                     if (needReload) {
                         if (ensureModelLoaded(recognizer, curCfg, true)) {
@@ -313,9 +317,13 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                     }
                 },
                 (SetUseGpuMsg msg) {
-                    if (recognizer is null) return;
-                    bool wasLoaded = recognizer.isLoaded();
                     curCfg.useGpu = msg.useGpu;
+                    if (recognizer is null) {
+                        uiLog(format(tr("[CFG] Compute mode: %s", "[CFG] Режим вычислений: %s"),
+                            msg.useGpu ? "GPU" : tr("CPU only", "Только процессор (CPU)")));
+                        return;
+                    }
+                    bool wasLoaded = recognizer.isLoaded();
                     recognizer.setUseGpu(msg.useGpu);
                     if (wasLoaded) {
                         unloadModelNow(recognizer, format(tr("Switching compute mode to %s...", "Переключение режима на %s..."), msg.useGpu ? "GPU" : "CPU"));
@@ -328,13 +336,11 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                     }
                 },
                 (SetLangMsg msg) {
-                    if (recognizer is null) return;
                     curCfg.language = msg.language;
-                    recognizer.setLanguage(msg.language);
+                    if (recognizer !is null) recognizer.setLanguage(msg.language);
                     uiLog(tr("[CFG] Speech language: ", "[CFG] Язык распознавания: ") ~ msg.language);
                 },
                 (WorkerCmd cmd) {
-                    if (cmd != WorkerCmd.shutdown && recognizer is null) return;
                     final switch (cmd) {
                         case WorkerCmd.shutdown:
                             running = false;
@@ -359,12 +365,14 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                             return;
 
                         case WorkerCmd.unloadModel:
-                            unloadModelNow(recognizer, tr("Model unloaded manually.", "Модель выгружена вручную."));
+                            if (recognizer !is null) {
+                                unloadModelNow(recognizer, tr("Model unloaded manually.", "Модель выгружена вручную."));
+                            }
                             return;
 
                         case WorkerCmd.idleCheck:
                             int mins = atomicLoad(g_state.unloadTimeoutMin);
-                            if (mins <= 0 || !recognizer.isLoaded() || atomicLoad(g_state.recording)) {
+                            if (recognizer is null || mins <= 0 || !recognizer.isLoaded() || atomicLoad(g_state.recording)) {
                                 return;
                             }
                             ulong idleMs = nowMs() - atomicLoad(g_state.lastActivityMs);
@@ -378,7 +386,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
 
                         case WorkerCmd.preview:
                             scope (exit) atomicStore(g_state.previewBusy, false);
-                            if (!atomicLoad(g_state.recording) || !recognizer.isLoaded()) return;
+                            if (recognizer is null || !atomicLoad(g_state.recording) || !recognizer.isLoaded()) return;
 
                             auto previewSamples = audio.peekBuffer(SAMPLE_RATE * 15);
                             if (!isSpeechValid(previewSamples, 0.4, cfg.rmsThreshold)) return;
@@ -394,7 +402,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                             double dur = cast(double) samples.length / SAMPLE_RATE;
                             double rms = calcRms(samples);
 
-                            if (!recognizer.isLoaded()) {
+                            if (recognizer is null || !recognizer.isLoaded()) {
                                 if (!ensureModelLoaded(recognizer, curCfg, true)) {
                                     return;
                                 }
@@ -509,13 +517,12 @@ version (unittest) {
         setUiLanguage(cfg.uiLanguage);
         bool isWhisper = normalizeEngine(cfg.engine) == "whisper";
         bool cliMode = checkOnly || setupOnly;
-        bool needTempConsole = !cliMode && allowDownload && !hasRuntimeDll(cfg);
-        if (needTempConsole) openTempConsole();
 
-        bool assetsOk = ensureAssets(cfg, allowDownload, cliMode || !allowDownload);
-        if (needTempConsole) closeTempConsole();
+        bool needAssetsAbort = cliMode
+            ? !ensureAssets(cfg, allowDownload, true)
+            : (!allowDownload && !hasRuntimeDll(cfg));
 
-        if (!assetsOk) {
+        if (needAssetsAbort) {
             auto msg = isWhisper
                 ? tr(
                     "Missing dependencies. Run with --setup or place whisper.dll and a model in bin/.",
@@ -525,7 +532,7 @@ version (unittest) {
                     "Missing sherpa-onnx / GigaAM dependencies. Check internet connection or paths in config.json.",
                     "Не хватает зависимостей sherpa-onnx / GigaAM. Проверьте интернет или пути в config.json."
                 );
-            if (checkOnly || setupOnly) { writeln(msg); stdout.flush(); }
+            if (cliMode) { writeln(msg); stdout.flush(); }
             else showErrorBox(msg);
             return 1;
         }
@@ -536,11 +543,14 @@ version (unittest) {
         }
 
         string err;
-        SttEngine recognizer = createSttEngine(cfg);
-        if (!recognizer.initApi(cfg, err)) {
-            if (checkOnly) { writeln(tr("Error: ", "Ошибка: "), err); stdout.flush(); }
-            else showErrorBox(err);
-            return 1;
+        SttEngine recognizer = null;
+        if (cliMode || hasRuntimeDll(cfg)) {
+            recognizer = createSttEngine(cfg);
+            if (!recognizer.initApi(cfg, err)) {
+                if (checkOnly) { writeln(tr("Error: ", "Ошибка: "), err); stdout.flush(); }
+                else showErrorBox(err);
+                return 1;
+            }
         }
         bool startedWorker = false;
         scope (exit) {
@@ -634,10 +644,14 @@ version (unittest) {
             }
         }
 
-        auto activeModelName = recognizer.modelPath().length ? baseName(recognizer.modelPath()) : cfg.sherpaModelType;
+        auto activeModelName = (recognizer !is null && recognizer.modelPath().length)
+            ? baseName(recognizer.modelPath())
+            : (normalizeEngine(cfg.engine) == "sherpa" ? cfg.sherpaModelType : baseName(cfg.modelPath));
+        string engineLabel = recognizer !is null ? recognizer.engineVersion() : normalizeEngine(cfg.engine);
+        bool gpuReady = recognizer !is null ? recognizer.supportsGpu() : (normalizeEngine(cfg.engine) != "sherpa");
         string[] initLogs = [
             format(tr("%s ready (%s, mode: %s)", "%s готов (%s, режим: %s)"),
-                recognizer.engineVersion(), activeModelName, recognizer.useGpu() ? "GPU" : "CPU"),
+                engineLabel, activeModelName, cfg.useGpu && gpuReady ? "GPU" : "CPU"),
             format(tr("Activation: [%s], speech lang: %s, auto-unload: %s", "Активация: [%s], язык: %s, автовыгрузка: %s"),
                 hotkeyName, cfg.language,
                 cfg.unloadTimeoutMin > 0
@@ -665,7 +679,7 @@ version (unittest) {
             cfg.startMinimized,
             cfg.autoLoadModel,
             !cfg.useGpu,
-            recognizer.supportsGpu(),
+            gpuReady,
             winAuto,
             cfg.showOverlay,
             cfg.beep,
