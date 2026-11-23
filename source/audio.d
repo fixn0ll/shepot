@@ -2,6 +2,7 @@ module audio;
 
 import core.atomic : atomicLoad, atomicStore;
 import core.stdc.stdlib : free, malloc, realloc;
+import core.sync.mutex : Mutex;
 import core.sys.windows.mmsystem;
 import core.sys.windows.winbase : CRITICAL_SECTION, DeleteCriticalSection, EnterCriticalSection,
     InitializeCriticalSection, LeaveCriticalSection;
@@ -43,6 +44,8 @@ struct AudioCapture {
     private size_t m_len;
     private size_t m_cap;
 
+    private int m_deviceId = -1;
+    private Mutex m_devMtx;
     private shared bool m_recording;
     private shared bool m_closing;
     private bool m_initialized;
@@ -50,6 +53,8 @@ struct AudioCapture {
     bool init(int deviceId, out string err) {
         atomicStore(m_closing, false);
         atomicStore(m_recording, false);
+        m_deviceId = deviceId;
+        if (m_devMtx is null) m_devMtx = new Mutex();
         InitializeCriticalSection(&m_cs);
         m_cap = InitialCapSamples;
         m_buf = cast(float*) malloc(m_cap * float.sizeof);
@@ -59,6 +64,24 @@ struct AudioCapture {
             return false;
         }
         m_len = 0;
+        m_initialized = true;
+
+        // Проверяем доступность микрофона на старте и сразу закрываем поток, чтобы значок Windows не горел в простое.
+        if (!openStream(err)) {
+            close();
+            return false;
+        }
+        closeStream();
+        return true;
+    }
+
+    bool isStreamOpen() const {
+        return m_handle !is null;
+    }
+
+    private bool openStream(out string err) {
+        if (m_handle !is null) return true;
+        atomicStore(m_closing, false);
 
         WAVEFORMATEX fmt;
         fmt.wFormatTag = WAVE_FORMAT_PCM;
@@ -69,7 +92,7 @@ struct AudioCapture {
         fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign;
         fmt.cbSize = 0;
 
-        UINT dev = deviceId < 0 ? WAVE_MAPPER : cast(UINT) deviceId;
+        UINT dev = m_deviceId < 0 ? WAVE_MAPPER : cast(UINT) m_deviceId;
         auto rc = waveInOpen(
             &m_handle,
             dev,
@@ -79,9 +102,7 @@ struct AudioCapture {
             CALLBACK_FUNCTION
         );
         if (rc != MMSYSERR_NOERROR) {
-            free(m_buf);
-            m_buf = null;
-            DeleteCriticalSection(&m_cs);
+            m_handle = null;
             err = "Не удалось открыть микрофон (waveInOpen)";
             return false;
         }
@@ -96,20 +117,39 @@ struct AudioCapture {
 
         rc = waveInStart(m_handle);
         if (rc != MMSYSERR_NOERROR) {
-            close();
+            closeStream();
             err = "Не удалось запустить поток захвата микрофона (waveInStart)";
             return false;
         }
-
-        m_initialized = true;
         return true;
     }
 
-    void startRecording() {
+    private void closeStream() {
+        atomicStore(m_closing, true);
+        if (m_handle !is null) {
+            waveInStop(m_handle);
+            waveInReset(m_handle);
+            foreach (i; 0 .. NumBuffers) {
+                if (m_headers[i].dwFlags & WHDR_PREPARED) {
+                    waveInUnprepareHeader(m_handle, &m_headers[i], WAVEHDR.sizeof);
+                }
+            }
+            waveInClose(m_handle);
+            m_handle = null;
+        }
+    }
+
+    bool startRecording(out string err) {
+        if (m_devMtx !is null) m_devMtx.lock();
+        scope (exit) if (m_devMtx !is null) m_devMtx.unlock();
+
         EnterCriticalSection(&m_cs);
         m_len = 0;
         LeaveCriticalSection(&m_cs);
+
+        if (!openStream(err)) return false;
         atomicStore(m_recording, true);
+        return true;
     }
 
     /// Возвращает копию текущего буфера без остановки записи (для live-предпросмотра).
@@ -123,8 +163,16 @@ struct AudioCapture {
         return m_buf[start .. m_len].dup;
     }
 
-    float[] stopAndTakeBuffer() {
+    void stopStream() {
         atomicStore(m_recording, false);
+        if (m_devMtx !is null) m_devMtx.lock();
+        scope (exit) if (m_devMtx !is null) m_devMtx.unlock();
+        closeStream();
+    }
+
+    float[] stopAndTakeBuffer() {
+        stopStream();
+        if (!m_initialized) return null;
         EnterCriticalSection(&m_cs);
         scope (exit) LeaveCriticalSection(&m_cs);
 
@@ -135,26 +183,19 @@ struct AudioCapture {
     }
 
     bool reopen(int deviceId, out string err) {
-        close();
-        return init(deviceId, err);
+        if (m_devMtx !is null) m_devMtx.lock();
+        scope (exit) if (m_devMtx !is null) m_devMtx.unlock();
+
+        bool wasOpen = (m_handle !is null);
+        closeStream();
+        m_deviceId = deviceId;
+        if (!openStream(err)) return false;
+        if (!wasOpen) closeStream();
+        return true;
     }
 
     void close() {
-        atomicStore(m_recording, false);
-        atomicStore(m_closing, true);
-
-        if (m_handle !is null) {
-            waveInStop(m_handle);
-            waveInReset(m_handle);
-            foreach (i; 0 .. NumBuffers) {
-                if (m_headers[i].dwFlags & WHDR_PREPARED) {
-                    waveInUnprepareHeader(m_handle, &m_headers[i], WAVEHDR.sizeof);
-                }
-            }
-            waveInClose(m_handle);
-            m_handle = null;
-        }
-
+        stopStream();
         if (m_buf !is null) {
             free(m_buf);
             m_buf = null;
@@ -207,4 +248,11 @@ private extern (Windows) void waveInCallback(
     if (uMsg != WIM_DATA || dwInstance == 0 || dwParam1 == 0) return;
     auto self = cast(AudioCapture*) dwInstance;
     self.onData(cast(WAVEHDR*) dwParam1);
+}
+
+unittest {
+    AudioCapture cap;
+    assert(!cap.isStreamOpen());
+    assert(cap.stopAndTakeBuffer() is null);
+    assert(cap.peekBuffer() is null);
 }

@@ -2,7 +2,7 @@ module app;
 
 import audio : AudioCapture, listInputDevices;
 import bootstrap : downloadModel, downloadSherpaModel, downloadSherpaRuntime,
-    downloadVulkanRuntime, ensureAssets, hasAllStartupAssets, isSherpaModelReady;
+    downloadVulkanRuntime, ensureAssets, hasAllStartupAssets, hasRuntimeDll, isSherpaModelReady;
 import config : AppConfig, applyModelPreset, builtinModelPresets, detectCustomModelFromFile,
     loadConfig, modelOptionId, modelRecommendation, normalizeEngine, normalizeInputMode,
     normalizeTheme, parseHotkeyVk, resolvePath, saveConfig, vkToKeyName;
@@ -500,10 +500,11 @@ version (unittest) {
 
         auto cfg = loadConfig();
         bool isWhisper = normalizeEngine(cfg.engine) == "whisper";
-        bool needTempConsole = !checkOnly && !setupOnly && allowDownload && !hasAllStartupAssets(cfg);
+        bool cliMode = checkOnly || setupOnly;
+        bool needTempConsole = !cliMode && allowDownload && !hasRuntimeDll(cfg);
         if (needTempConsole) openTempConsole();
 
-        bool assetsOk = ensureAssets(cfg, allowDownload);
+        bool assetsOk = ensureAssets(cfg, allowDownload, cliMode || !allowDownload);
         if (needTempConsole) closeTempConsole();
 
         if (!assetsOk) {
@@ -569,7 +570,12 @@ version (unittest) {
             import core.thread : Thread;
             import core.time : msecs;
             writefln("Engine=%s", recognizer.engineVersion());
-            capture.startRecording();
+            string chkMicErr;
+            if (!capture.startRecording(chkMicErr)) {
+                writeln("Ошибка микрофона: ", chkMicErr);
+                stdout.flush();
+                return 1;
+            }
             Thread.sleep(500.msecs);
             auto testBuf = capture.stopAndTakeBuffer();
             writefln("Микрофон: %s сэмплов за 500мс, RMS=%.5f", testBuf.length, calcRms(testBuf));
@@ -649,9 +655,16 @@ version (unittest) {
             cfg.autoLoadModel,
             initLogs,
             () {
+                string micErr;
+                if (!capture.startRecording(micErr)) {
+                    atomicStore(g_state.recording, false);
+                    uiLog("[MIC ОШИБКА] " ~ micErr);
+                    uiSetIdleStatus(atomicLoad(g_state.modelLoaded));
+                    uiSetVisual(VisualState.idle, "Ошибка микрофона", 1200);
+                    return;
+                }
                 atomicStore(g_state.recording, true);
                 atomicStore(g_state.lastActivityMs, nowMs());
-                capture.startRecording();
                 bool beepOn = atomicLoad(g_state.beepEnabled);
 
                 if (!atomicLoad(g_state.modelLoaded)) {
@@ -675,6 +688,7 @@ version (unittest) {
             () {
                 atomicStore(g_state.recording, false);
                 atomicStore(g_state.lastActivityMs, nowMs());
+                capture.stopStream();
                 uiSetVisual(VisualState.processing, "Обработка голоса...");
                 if (atomicLoad(g_state.modelLoaded) && atomicLoad(g_state.beepEnabled)) {
                     playCueAsync(false);

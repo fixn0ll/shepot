@@ -33,19 +33,27 @@ bool isSherpaModelReady(const ref AppConfig cfg) {
            cfg.sherpaJoiner.length > 0 && exists(resolvePath(cfg.sherpaJoiner));
 }
 
-bool hasAllStartupAssets(const ref AppConfig cfg) {
+bool hasRuntimeDll(const ref AppConfig cfg) {
     if (normalizeEngine(cfg.engine) == "sherpa") {
-        return exists(resolvePath(cfg.sherpaDll)) && isSherpaModelReady(cfg);
+        return exists(resolvePath(cfg.sherpaDll));
     }
-    return exists(resolvePath(cfg.whisperDll)) && exists(resolvePath(cfg.modelPath));
+    return exists(resolvePath(cfg.whisperDll));
+}
+
+bool hasAllStartupAssets(const ref AppConfig cfg) {
+    if (!hasRuntimeDll(cfg)) return false;
+    if (normalizeEngine(cfg.engine) == "sherpa") {
+        return isSherpaModelReady(cfg);
+    }
+    return exists(resolvePath(cfg.modelPath));
 }
 
 /// Проверяет наличие DLL и модели для активного движка; при отсутствии скачивает автоматически.
-bool ensureAssets(const ref AppConfig cfg, bool allowDownload) {
+bool ensureAssets(const ref AppConfig cfg, bool allowDownload, bool includeModel = true) {
     if (normalizeEngine(cfg.engine) == "sherpa") {
         auto dllPath = resolvePath(cfg.sherpaDll);
         bool dllOk = exists(dllPath);
-        bool mdlOk = isSherpaModelReady(cfg);
+        bool mdlOk = !includeModel || isSherpaModelReady(cfg);
         if (dllOk && mdlOk) return true;
 
         if (!allowDownload) {
@@ -62,17 +70,19 @@ bool ensureAssets(const ref AppConfig cfg, bool allowDownload) {
 
     auto dllPath = resolvePath(cfg.whisperDll);
     auto modelPath = resolvePath(cfg.modelPath);
-    if (exists(dllPath) && exists(modelPath)) return true;
+    bool dllOk = exists(dllPath);
+    bool mdlOk = !includeModel || exists(modelPath);
+    if (dllOk && mdlOk) return true;
 
     if (!allowDownload) {
-        if (!exists(dllPath)) writefln("Отсутствует библиотека: %s", dllPath);
-        if (!exists(modelPath)) writefln("Отсутствует модель: %s", modelPath);
+        if (!dllOk) writefln("Отсутствует библиотека: %s", dllPath);
+        if (!mdlOk) writefln("Отсутствует модель: %s", modelPath);
         stdout.flush();
         return false;
     }
 
-    if (!exists(dllPath) && !downloadVulkanRuntime(dirName(dllPath), null)) return false;
-    if (!exists(modelPath) && !downloadModel(modelPath, null)) return false;
+    if (!dllOk && !downloadVulkanRuntime(dirName(dllPath), null)) return false;
+    if (!mdlOk && !downloadModel(modelPath, null)) return false;
     return true;
 }
 
@@ -165,7 +175,8 @@ bool downloadSherpaModel(const ref AppConfig cfg, void delegate(int pct) onProgr
         mkdirRecurse(dirName(modelAbs));
 
         if (!exists(tokensAbs)) {
-            if (!downloadFile(GigaAmMultiTokensUrl, tokensAbs, null)) return false;
+            void delegate(int) tokCb = onProgress !is null ? (int _) {} : null;
+            if (!downloadFile(GigaAmMultiTokensUrl, tokensAbs, tokCb)) return false;
         }
         if (!exists(modelAbs)) {
             if (onProgress is null) writeln("Скачивание GigaAM Multilingual CTC int8 (~215 МБ)...");
@@ -239,7 +250,12 @@ int parseCurlPercent(string line) {
 }
 
 private bool runCurlWithProgress(string[] cmd, void delegate(int) onProgress) {
-    auto pipes = pipeProcess(cmd, Redirect.stderrToStdout | Redirect.stdin, null, Config.suppressConsole);
+    auto pipes = pipeProcess(
+        cmd,
+        Redirect.stdout | Redirect.stderrToStdout | Redirect.stdin,
+        null,
+        Config.suppressConsole
+    );
     pipes.stdin.close();
 
     int lastPct = -1;
@@ -285,4 +301,8 @@ unittest {
     assert(parseCurlPercent("######                         54.1%") == 54);
     assert(parseCurlPercent("######################################## 100.0%") == 100);
     assert(parseCurlPercent("##O#-#") == -1);
+
+    int lastSeen = -1;
+    bool pipeOk = runCurlWithProgress(["cmd.exe", "/c", "echo ###### 75.0%"], (int pct) { lastSeen = pct; });
+    assert(pipeOk && lastSeen == 75);
 }

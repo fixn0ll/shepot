@@ -35,6 +35,9 @@ import std.utf : toUTF16, toUTF16z, toUTF8;
 
 private enum uint WM_APP_TRAY = WM_APP + 1;
 private enum uint WM_APP_SYNC = WM_APP + 2;
+private enum uint WM_APP_HOOK_START = WM_APP + 3;
+private enum uint WM_APP_HOOK_STOP = WM_APP + 4;
+private enum uint WM_APP_HOOK_CANCEL = WM_APP + 5;
 
 private enum int ID_BTN_HIDE = 101;
 private enum int ID_BTN_MODEL = 102;
@@ -2238,6 +2241,18 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 flushPendingUi(hwnd);
                 return 0;
 
+            case WM_APP_HOOK_START:
+                if (g_ui.onStart !is null) g_ui.onStart();
+                return 0;
+
+            case WM_APP_HOOK_STOP:
+                if (g_ui.onStop !is null) g_ui.onStop();
+                return 0;
+
+            case WM_APP_HOOK_CANCEL:
+                if (g_ui.onCancel !is null) g_ui.onCancel();
+                return 0;
+
             case WM_CLOSE:
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
@@ -2292,7 +2307,7 @@ private bool handleTriggerEvent(uint vk, bool isDownMsg, bool isUpMsg, bool isMo
         if (g_ui.isDown && !isMouse && vk == VK_ESCAPE && isDownMsg) {
             g_ui.isDown = false;
             if (!g_ui.toggleMode) g_ui.waitRelease = true;
-            if (g_ui.onCancel !is null) g_ui.onCancel();
+            if (g_ui.hwnd !is null) PostMessageW(g_ui.hwnd, WM_APP_HOOK_CANCEL, 0, 0);
             return true;
         }
 
@@ -2302,10 +2317,10 @@ private bool handleTriggerEvent(uint vk, bool isDownMsg, bool isUpMsg, bool isMo
                     g_ui.keyPhysicallyDown = true;
                     if (!g_ui.isDown) {
                         g_ui.isDown = true;
-                        if (g_ui.onStart !is null) g_ui.onStart();
+                        if (g_ui.hwnd !is null) PostMessageW(g_ui.hwnd, WM_APP_HOOK_START, 0, 0);
                     } else {
                         g_ui.isDown = false;
-                        if (g_ui.onStop !is null) g_ui.onStop();
+                        if (g_ui.hwnd !is null) PostMessageW(g_ui.hwnd, WM_APP_HOOK_STOP, 0, 0);
                     }
                 } else if (isUpMsg) {
                     g_ui.keyPhysicallyDown = false;
@@ -2320,10 +2335,10 @@ private bool handleTriggerEvent(uint vk, bool isDownMsg, bool isUpMsg, bool isMo
 
             if (isDownMsg && !g_ui.isDown) {
                 g_ui.isDown = true;
-                if (g_ui.onStart !is null) g_ui.onStart();
+                if (g_ui.hwnd !is null) PostMessageW(g_ui.hwnd, WM_APP_HOOK_START, 0, 0);
             } else if (isUpMsg && g_ui.isDown) {
                 g_ui.isDown = false;
-                if (g_ui.onStop !is null) g_ui.onStop();
+                if (g_ui.hwnd !is null) PostMessageW(g_ui.hwnd, WM_APP_HOOK_STOP, 0, 0);
             }
             return isMouse || g_ui.blockHotkey;
         }
