@@ -7,26 +7,29 @@ import core.sys.windows.commdlg : GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHA
     OFN_PATHMUSTEXIST, OPENFILENAMEW;
 import core.sys.windows.commctrl;
 import core.sys.windows.shellapi;
-import core.sys.windows.winbase : CloseHandle, CreateMutexW, GetFileType, GetLastError,
-    GetModuleHandleW, GetStdHandle, GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
-    STD_OUTPUT_HANDLE;
+import core.sys.windows.winbase : CloseHandle, CreateMutexW, FreeLibrary, GetFileType, GetLastError,
+    GetModuleHandleW, GetProcAddress, GetStdHandle, GlobalAlloc, GlobalLock, GlobalUnlock,
+    GMEM_MOVEABLE, LoadLibraryW, STD_OUTPUT_HANDLE;
 import core.sys.windows.wincon : AllocConsole, ATTACH_PARENT_PROCESS, AttachConsole,
     FreeConsole, SetConsoleCP, SetConsoleOutputCP;
-import core.sys.windows.windef : BYTE, COLORREF, DWORD, ERROR_SUCCESS, FALSE, HBITMAP, HBRUSH, HDC, HFONT,
-    HGLOBAL, HHOOK, HICON, HKEY, HMENU, HRGN, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, UINT, WORD, WPARAM;
+import core.sys.windows.basetsd : LONG_PTR, UINT_PTR;
+import core.sys.windows.windef : BOOL, BYTE, COLORREF, DWORD, ERROR_SUCCESS, FALSE, HBITMAP, HBRUSH,
+    HDC, HFONT, HGLOBAL, HHOOK, HICON, HKEY, HMENU, HMODULE, HPEN, HRGN, HRESULT, HWND, LPARAM,
+    LRESULT, POINT, RECT, SIZE, TRUE, UINT, WORD, WPARAM;
 import core.sys.windows.winerror : ERROR_ALREADY_EXISTS;
 import core.sys.windows.wingdi;
 import core.sys.windows.winnt : HANDLE, KEY_READ, KEY_WRITE;
-import core.sys.windows.winreg : HKEY_CURRENT_USER, REG_SZ, RegCloseKey, RegDeleteValueW,
+import core.sys.windows.winreg : HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RegCloseKey, RegDeleteValueW,
     RegOpenKeyExW, RegQueryValueExW, RegSetValueExW;
 import core.sys.windows.winuser;
 import core.thread : Thread;
 import core.time : msecs;
 import sound : playClickAsync;
 import std.algorithm : max, min;
-import std.file : thisExePath;
+import std.file : exists, mkdirRecurse, thisExePath, write;
 import std.format : format;
 import std.math : fabs, sqrt;
+import std.path : buildPath, dirName;
 import std.range : walkLength;
 import std.utf : toUTF16, toUTF16z, toUTF8;
 
@@ -51,6 +54,14 @@ private enum int ID_EDIT_LOG = 115;
 private enum int ID_COMBO_INPUT_MODE = 116;
 private enum int ID_CHK_TOGGLE_MODE = 117;
 private enum int ID_BTN_BROWSE_MODEL = 118;
+private enum int ID_CHK_OVERWRITE_CLIP = 119;
+private enum int ID_NAV_MAIN = 120;
+private enum int ID_NAV_SETTINGS = 121;
+private enum int ID_BTN_COPY_LAST = 122;
+private enum int ID_BTN_CLEAR_LOG = 123;
+private enum int ID_COMBO_THEME = 124;
+private enum int ID_BTN_OPEN_REPL = 125;
+private enum int ID_BTN_OPEN_MODELS = 126;
 
 private enum int ID_TRAY_TOGGLE = 201;
 private enum int ID_TRAY_EXIT = 202;
@@ -64,12 +75,14 @@ private enum int ID_TRAY_LIVE_PREVIEW = 209;
 private enum int ID_TRAY_COPY_LAST = 210;
 private enum int ID_TRAY_TOGGLE_MODE = 211;
 private enum int ID_TRAY_BROWSE_MODEL = 212;
+private enum int ID_TRAY_OVERWRITE_CLIP = 213;
 
 private enum int ID_TRAY_MIC_BASE = 1000;
 private enum int ID_TRAY_MODEL_BASE = 2000;
 private enum int ID_TRAY_LANG_BASE = 3000;
 private enum int ID_TRAY_TIMEOUT_BASE = 4000;
 private enum int ID_TRAY_INPUT_MODE_BASE = 5000;
+private enum int ID_TRAY_THEME_BASE = 6000;
 
 private enum size_t ID_TIMER_IDLE = 1;
 private enum size_t ID_TIMER_CLICK = 2;
@@ -89,6 +102,7 @@ private enum wstring RUN_REG_VALUE = "Shepot"w;
 struct UiOption {
     string label;
     string value;
+    string hint = "";
 }
 
 struct TimeoutOption {
@@ -110,6 +124,12 @@ static immutable UiOption[] inputModeOptions = [
     UiOption("Посимвольно (игры / SendInput)", "sendinput"),
     UiOption("Буфер обмена (Ctrl+V)", "clipboard"),
     UiOption("Авто (<=80 симв. — посимвольно)", "auto"),
+];
+
+static immutable UiOption[] themeOptions = [
+    UiOption("Авто (как в Windows)", "auto"),
+    UiOption("Светлая", "light"),
+    UiOption("Тёмная", "dark"),
 ];
 
 private struct AppUiState {
@@ -135,8 +155,12 @@ private struct AppUiState {
     string currentLang;
     int currentTimeoutMin;
     string currentInputMode = "sendinput";
+    string currentTheme = "auto";
+    bool darkActive;
+    int activePage = 0; // 0 = Главная, 1 = Настройки
     bool cpuOnly;
     bool gpuAvailable = true;
+    bool overwriteNonTextClip;
     bool beepEnabled;
     bool livePreview;
     bool winAutostart;
@@ -152,6 +176,8 @@ private struct AppUiState {
     void delegate() onModelToggle;
     void delegate(int) onTimeoutChange;
     void delegate(string) onInputModeChange;
+    void delegate(string) onThemeChange;
+    void delegate(bool) onOverwriteClipChange;
     void delegate(bool) onToggleModeChange;
     void delegate(bool) onAutoLoadChange;
     void delegate(bool) onCpuOnlyChange;
@@ -164,6 +190,8 @@ private struct AppUiState {
     void delegate() onPreviewTick;
 
     HWND hwnd;
+    HWND btnNavMain;
+    HWND btnNavSettings;
     HWND lblStatus;
     HWND btnHide;
     HWND btnModel;
@@ -173,6 +201,10 @@ private struct AppUiState {
     HWND lblModel;
     HWND comboModel;
     HWND btnBrowseModel;
+    HWND lblModelHint;
+    HWND hwndTip;
+    HWND comboModelList;
+    int lastHoveredModelIdx = -1;
     HWND lblLang;
     HWND comboLang;
     HWND lblHotkey;
@@ -181,6 +213,8 @@ private struct AppUiState {
     HWND comboTimeout;
     HWND lblInputMode;
     HWND comboInputMode;
+    HWND lblTheme;
+    HWND comboTheme;
     HWND chkAutoLoad;
     HWND chkCpuOnly;
     HWND chkStartTray;
@@ -188,15 +222,26 @@ private struct AppUiState {
     HWND chkLivePreview;
     HWND chkOverlay;
     HWND chkToggleMode;
+    HWND chkOverwriteClip;
+    HWND btnOpenReplacements;
+    HWND btnOpenModelsDir;
     HWND lblLog;
+    HWND btnCopyLast;
+    HWND btnClearLog;
     HWND editLog;
+
+    HBRUSH darkBgBrush;
+    HBRUSH darkEditBrush;
+    HBRUSH darkSurfaceBrush;
 
     HFONT fontTitle;
     HFONT fontBtnBold;
     HFONT fontUi;
+    HFONT fontHint;
     HFONT fontMono;
     HICON iconBig;
     HICON iconSmall;
+    HICON iconUnloaded;
     HICON iconRec;
     HICON iconProc;
     HICON iconPasted;
@@ -228,6 +273,8 @@ private struct AppUiState {
 
 private __gshared AppUiState g_ui;
 private __gshared HANDLE g_singleInstanceMutex = null;
+private __gshared WNDPROC g_origBtnProc = null;
+private __gshared WNDPROC g_origListProc = null;
 
 /// Гарантирует запуск единственного экземпляра приложения; при наличии уже запущенного — разворачивает его окно.
 bool acquireSingleInstance() {
@@ -320,7 +367,7 @@ bool setWindowsAutostart(bool enable) {
     return RegSetValueExW(hKey, RUN_REG_VALUE.ptr, 0, REG_SZ, cast(const(ubyte)*) z.ptr, bytes) == ERROR_SUCCESS;
 }
 
-bool typeText(string text, string inputMode, int charDelayMs, int restoreDelayMs, out string methodUsed) {
+bool typeText(string text, string inputMode, int charDelayMs, int restoreDelayMs, out string methodUsed, bool overwriteNonText = false) {
     if (text.length == 0) {
         methodUsed = "empty";
         return false;
@@ -334,7 +381,7 @@ bool typeText(string text, string inputMode, int charDelayMs, int restoreDelayMs
     }
 
     if (useClipboard) {
-        if (pasteViaClipboard(text, restoreDelayMs)) {
+        if (pasteViaClipboard(text, restoreDelayMs, overwriteNonText)) {
             methodUsed = "clipboard+Ctrl+V";
             return true;
         }
@@ -356,16 +403,17 @@ private bool openClipboardRetry() {
     return false;
 }
 
-private bool pasteViaClipboard(string text, int restoreDelayMs) {
+private bool pasteViaClipboard(string text, int restoreDelayMs, bool overwriteNonText) {
     wstring prevText;
     bool hadPrevText = false;
 
     if (!openClipboardRetry()) return false;
 
     bool hasText = IsClipboardFormatAvailable(CF_UNICODETEXT) != 0;
-    if (!hasText && CountClipboardFormats() > 0) {
+    if (!hasText && CountClipboardFormats() > 0 && !overwriteNonText) {
         // В буфере картинка, файлы или другие данные — не затираем буфер обмена.
         CloseClipboard();
+        uiLog("[CLIP] В буфере картинка/файлы — вставка посимвольно без затирания (опция «Заменять нетекстовый буфер» выключена).");
         return false;
     }
 
@@ -597,6 +645,8 @@ bool runTrayApp(
     UiOption[] langOptions,
     string initialLang,
     string initialInputMode,
+    string initialTheme,
+    bool overwriteNonTextClip,
     bool startMinimized,
     bool autoLoad,
     bool cpuOnly,
@@ -620,6 +670,8 @@ bool runTrayApp(
     void delegate() onModelToggle,
     void delegate(int) onTimeoutChange,
     void delegate(string) onInputModeChange,
+    void delegate(string) onThemeChange,
+    void delegate(bool) onOverwriteClipChange,
     void delegate(bool) onToggleModeChange,
     void delegate(bool) onAutoLoadChange,
     void delegate(bool) onCpuOnlyChange,
@@ -655,6 +707,9 @@ bool runTrayApp(
     g_ui.currentLang = initialLang;
     g_ui.currentTimeoutMin = initialTimeoutMin;
     g_ui.currentInputMode = initialInputMode.length ? initialInputMode : "sendinput";
+    g_ui.currentTheme = initialTheme.length ? initialTheme : "auto";
+    g_ui.activePage = 0;
+    g_ui.overwriteNonTextClip = overwriteNonTextClip;
     g_ui.cpuOnly = cpuOnly;
     g_ui.gpuAvailable = gpuAvailable;
     g_ui.beepEnabled = beepEnabled;
@@ -673,6 +728,8 @@ bool runTrayApp(
     g_ui.onModelToggle = onModelToggle;
     g_ui.onTimeoutChange = onTimeoutChange;
     g_ui.onInputModeChange = onInputModeChange;
+    g_ui.onThemeChange = onThemeChange;
+    g_ui.onOverwriteClipChange = onOverwriteClipChange;
     g_ui.onToggleModeChange = onToggleModeChange;
     g_ui.onAutoLoadChange = onAutoLoadChange;
     g_ui.onCpuOnlyChange = onCpuOnlyChange;
@@ -691,6 +748,7 @@ bool runTrayApp(
     g_ui.iconSmall = cast(HICON) LoadImageW(hInst, cast(const(wchar)*) 1, IMAGE_ICON, 16, 16, 0);
     if (g_ui.iconBig is null) g_ui.iconBig = LoadIconW(null, IDI_APPLICATION);
     if (g_ui.iconSmall is null) g_ui.iconSmall = LoadIconW(null, IDI_APPLICATION);
+    g_ui.iconUnloaded = createMicIcon(16, 100, 116, 139, 71, 85, 105);
     g_ui.iconRec = createMicIcon(16, 239, 68, 68, 194, 38, 38);
     g_ui.iconProc = createMicIcon(16, 245, 158, 11, 217, 119, 6);
     g_ui.iconPasted = createMicIcon(16, 16, 185, 129, 4, 120, 87);
@@ -720,7 +778,7 @@ bool runTrayApp(
         clsName,
         "Shepot — Голосовой ввод"w.ptr,
         style,
-        CW_USEDEFAULT, CW_USEDEFAULT, 600, 655,
+        CW_USEDEFAULT, CW_USEDEFAULT, 580, 540,
         null, null, hInst, null
     );
     if (g_ui.hwnd is null) return false;
@@ -735,6 +793,7 @@ bool runTrayApp(
     populateOptionCombo(g_ui.comboLang, langOptions, initialLang);
     populateTimeoutCombo(initialTimeoutMin);
     populateOptionCombo(g_ui.comboInputMode, cast(UiOption[]) inputModeOptions, g_ui.currentInputMode);
+    populateOptionCombo(g_ui.comboTheme, cast(UiOption[]) themeOptions, g_ui.currentTheme);
 
     SendMessageW(g_ui.chkAutoLoad, BM_SETCHECK, autoLoad ? BST_CHECKED : BST_UNCHECKED, 0);
     syncCpuOnlyControl();
@@ -743,8 +802,12 @@ bool runTrayApp(
     SendMessageW(g_ui.chkLivePreview, BM_SETCHECK, livePreview ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_ui.chkOverlay, BM_SETCHECK, showOverlay ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_ui.chkToggleMode, BM_SETCHECK, toggleMode ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_ui.chkOverwriteClip, BM_SETCHECK, overwriteNonTextClip ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(g_ui.btnHotkey, ("Назначить: [" ~ hotkeyName ~ "]").toUTF16z());
     applyModelButtonState(initialLoaded, initialLoading);
+    refreshModelHint();
+    setActivePage(0);
+    applyWindowTheme(g_ui.hwnd);
 
     foreach (line; initialLogs) uiLog(line);
     if (initialLoading) {
@@ -874,6 +937,7 @@ void uiSetModelOptions(UiOption[] options, string currentVal) {
     if (g_ui.comboModel !is null) {
         populateOptionCombo(g_ui.comboModel, options, currentVal);
     }
+    refreshModelHint();
 }
 
 private void openCustomModelDialog(HWND hwnd) {
@@ -954,69 +1018,97 @@ private void applyProgressState(int mode, int pct) {
 private void layoutChildren(int w, int h) {
     if (g_ui.lblStatus is null) return;
     int pad = 14;
-    int hideW = 128;
-    int labelW = 152;
-    int ctrlW = w - pad * 2 - labelW - 8;
-
+    int hideW = 124;
+    int navW = 104;
     int y = pad;
-    MoveWindow(g_ui.lblStatus, pad, y + 3, w - pad * 3 - hideW, 24, TRUE);
+    MoveWindow(g_ui.btnNavMain, pad, y, navW, 28, TRUE);
+    MoveWindow(g_ui.btnNavSettings, pad + navW + 6, y, navW + 8, 28, TRUE);
     MoveWindow(g_ui.btnHide, w - pad - hideW, y, hideW, 28, TRUE);
 
-    y += 36;
-    MoveWindow(g_ui.btnModel, pad, y, w - pad * 2, 36, TRUE);
+    // Страница 0: Главная
+    int my = y + 38;
+    MoveWindow(g_ui.lblStatus, pad, my, w - pad * 2, 24, TRUE);
 
-    y += 40;
-    MoveWindow(g_ui.progressBar, pad, y, w - pad * 2, 12, TRUE);
+    my += 30;
+    MoveWindow(g_ui.btnModel, pad, my, w - pad * 2, 36, TRUE);
 
-    y += 20;
-    MoveWindow(g_ui.lblMic, pad, y + 4, labelW, 20, TRUE);
-    MoveWindow(g_ui.comboMic, pad + labelW + 8, y, ctrlW, 220, TRUE);
+    my += 42;
+    MoveWindow(g_ui.progressBar, pad, my, w - pad * 2, 10, TRUE);
 
-    y += 32;
-    int browseW = 74;
-    MoveWindow(g_ui.lblModel, pad, y + 4, labelW, 20, TRUE);
-    MoveWindow(g_ui.comboModel, pad + labelW + 8, y, ctrlW - browseW - 6, 220, TRUE);
-    MoveWindow(g_ui.btnBrowseModel, pad + labelW + 8 + ctrlW - browseW, y - 1, browseW, 25, TRUE);
+    my += 20;
+    int mLabelW = 72;
+    int browseW = 78;
+    int mComboW = w - pad * 2 - mLabelW - browseW - 14;
+    MoveWindow(g_ui.lblModel, pad, my + 4, mLabelW, 20, TRUE);
+    MoveWindow(g_ui.comboModel, pad + mLabelW + 6, my, mComboW, 220, TRUE);
+    MoveWindow(g_ui.btnBrowseModel, w - pad - browseW, my - 1, browseW, 25, TRUE);
 
-    y += 32;
-    MoveWindow(g_ui.lblLang, pad, y + 4, labelW, 20, TRUE);
-    MoveWindow(g_ui.comboLang, pad + labelW + 8, y, ctrlW, 220, TRUE);
+    my += 29;
+    MoveWindow(g_ui.lblModelHint, pad + mLabelW + 6, my, w - pad * 2 - mLabelW - 6, 32, TRUE);
 
-    y += 32;
-    MoveWindow(g_ui.lblHotkey, pad, y + 5, labelW, 20, TRUE);
-    MoveWindow(g_ui.btnHotkey, pad + labelW + 8, y, ctrlW, 28, TRUE);
+    my += 36;
+    int clearW = 80;
+    int copyW = 136;
+    MoveWindow(g_ui.lblLog, pad, my + 4, w - pad * 2 - copyW - clearW - 14, 18, TRUE);
+    MoveWindow(g_ui.btnCopyLast, w - pad - clearW - copyW - 6, my, copyW, 24, TRUE);
+    MoveWindow(g_ui.btnClearLog, w - pad - clearW, my, clearW, 24, TRUE);
 
-    y += 34;
-    MoveWindow(g_ui.lblTimeout, pad, y + 4, labelW, 20, TRUE);
-    MoveWindow(g_ui.comboTimeout, pad + labelW + 8, y, ctrlW, 220, TRUE);
+    my += 30;
+    int logH = h - my - pad;
+    if (logH < 80) logH = 80;
+    MoveWindow(g_ui.editLog, pad, my, w - pad * 2, logH, TRUE);
 
-    y += 32;
-    MoveWindow(g_ui.lblInputMode, pad, y + 4, labelW, 20, TRUE);
-    MoveWindow(g_ui.comboInputMode, pad + labelW + 8, y, ctrlW, 220, TRUE);
+    // Страница 1: Настройки
+    int labelW = 166;
+    int ctrlW = w - pad * 2 - labelW - 8;
+    int sy = y + 40;
+    MoveWindow(g_ui.lblMic, pad, sy + 4, labelW, 20, TRUE);
+    MoveWindow(g_ui.comboMic, pad + labelW + 8, sy, ctrlW, 220, TRUE);
 
-    y += 32;
+    sy += 34;
+    MoveWindow(g_ui.lblLang, pad, sy + 4, labelW, 20, TRUE);
+    MoveWindow(g_ui.comboLang, pad + labelW + 8, sy, ctrlW, 220, TRUE);
+
+    sy += 34;
+    MoveWindow(g_ui.lblHotkey, pad, sy + 5, labelW, 20, TRUE);
+    MoveWindow(g_ui.btnHotkey, pad + labelW + 8, sy, ctrlW, 28, TRUE);
+
+    sy += 36;
+    MoveWindow(g_ui.lblTimeout, pad, sy + 4, labelW, 20, TRUE);
+    MoveWindow(g_ui.comboTimeout, pad + labelW + 8, sy, ctrlW, 220, TRUE);
+
+    sy += 34;
+    MoveWindow(g_ui.lblInputMode, pad, sy + 4, labelW, 20, TRUE);
+    MoveWindow(g_ui.comboInputMode, pad + labelW + 8, sy, ctrlW, 220, TRUE);
+
+    sy += 34;
+    MoveWindow(g_ui.lblTheme, pad, sy + 4, labelW, 20, TRUE);
+    MoveWindow(g_ui.comboTheme, pad + labelW + 8, sy, ctrlW, 220, TRUE);
+
+    sy += 38;
     int halfW = (w - pad * 3) / 2;
-    MoveWindow(g_ui.chkAutoLoad, pad, y, halfW, 22, TRUE);
-    MoveWindow(g_ui.chkCpuOnly, pad * 2 + halfW, y, halfW, 22, TRUE);
+    MoveWindow(g_ui.chkAutoLoad, pad, sy, halfW, 22, TRUE);
+    MoveWindow(g_ui.chkCpuOnly, pad * 2 + halfW, sy, halfW, 22, TRUE);
 
-    y += 24;
-    MoveWindow(g_ui.chkStartTray, pad, y, halfW, 22, TRUE);
-    MoveWindow(g_ui.chkWinAuto, pad * 2 + halfW, y, halfW, 22, TRUE);
+    sy += 26;
+    MoveWindow(g_ui.chkStartTray, pad, sy, halfW, 22, TRUE);
+    MoveWindow(g_ui.chkWinAuto, pad * 2 + halfW, sy, halfW, 22, TRUE);
 
-    y += 24;
-    MoveWindow(g_ui.chkLivePreview, pad, y, halfW, 22, TRUE);
-    MoveWindow(g_ui.chkOverlay, pad * 2 + halfW, y, halfW, 22, TRUE);
+    sy += 26;
+    MoveWindow(g_ui.chkLivePreview, pad, sy, halfW, 22, TRUE);
+    MoveWindow(g_ui.chkOverlay, pad * 2 + halfW, sy, halfW, 22, TRUE);
 
-    y += 24;
-    MoveWindow(g_ui.chkToggleMode, pad, y, halfW, 22, TRUE);
+    sy += 26;
+    MoveWindow(g_ui.chkToggleMode, pad, sy, halfW, 22, TRUE);
+    MoveWindow(g_ui.chkOverwriteClip, pad * 2 + halfW, sy, halfW, 22, TRUE);
 
-    y += 28;
-    MoveWindow(g_ui.lblLog, pad, y, w - pad * 2, 18, TRUE);
+    sy += 34;
+    MoveWindow(g_ui.btnOpenReplacements, pad, sy, halfW, 28, TRUE);
+    MoveWindow(g_ui.btnOpenModelsDir, pad * 2 + halfW, sy, halfW, 28, TRUE);
+}
 
-    y += 22;
-    int logH = h - y - pad;
-    if (logH < 60) logH = 60;
-    MoveWindow(g_ui.editLog, pad, y, w - pad * 2, logH, TRUE);
+private HICON idleTrayIcon() {
+    return g_ui.modelLoaded ? g_ui.iconSmall : g_ui.iconUnloaded;
 }
 
 private void addTrayIcon(HWND hwnd) {
@@ -1025,7 +1117,7 @@ private void addTrayIcon(HWND hwnd) {
     g_ui.nid.uID = 1;
     g_ui.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_ui.nid.uCallbackMessage = WM_APP_TRAY;
-    g_ui.nid.hIcon = g_ui.iconSmall;
+    g_ui.nid.hIcon = idleTrayIcon();
     setTrayTip("Shepot");
     Shell_NotifyIconW(NIM_ADD, &g_ui.nid);
 }
@@ -1108,10 +1200,19 @@ private void showTrayMenu(HWND hwnd) {
     }
     AppendMenuW(menu, MF_POPUP, cast(size_t) subInputMode, "Режим ввода"w.ptr);
 
+    HMENU subTheme = CreatePopupMenu();
+    foreach (i, opt; themeOptions) {
+        UINT fl = MF_STRING | (opt.value == g_ui.currentTheme ? MF_CHECKED : MF_UNCHECKED);
+        AppendMenuW(subTheme, fl, ID_TRAY_THEME_BASE + i, opt.label.toUTF16z());
+    }
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subTheme, "Тема оформления"w.ptr);
+
     AppendMenuW(menu, MF_STRING, ID_TRAY_HOTKEY,
         ("Назначить клавишу [" ~ g_ui.hotkeyName ~ "]").toUTF16z());
     AppendMenuW(menu, MF_STRING | (g_ui.toggleMode ? MF_CHECKED : MF_UNCHECKED),
         ID_TRAY_TOGGLE_MODE, "Режим переключения (Toggle)"w.ptr);
+    AppendMenuW(menu, MF_STRING | (g_ui.overwriteNonTextClip ? MF_CHECKED : MF_UNCHECKED),
+        ID_TRAY_OVERWRITE_CLIP, "Заменять нетекстовый буфер"w.ptr);
 
     AppendMenuW(menu, MF_SEPARATOR, 0, null);
     bool cpuDisplay = !g_ui.gpuAvailable || g_ui.cpuOnly;
@@ -1254,10 +1355,18 @@ private void flushPendingUi(HWND hwnd) {
 
     if (hasLastPhrase) {
         g_ui.lastPhrase = lastPhrase;
+        if (g_ui.btnCopyLast !is null) {
+            EnableWindow(g_ui.btnCopyLast, g_ui.lastPhrase.length > 0 ? TRUE : FALSE);
+        }
     }
 
+    bool modifyTray = false;
     if (modelState >= 0) {
         applyModelButtonState(modelState == 1, modelState == 2);
+        if (g_ui.hudState == VisualState.idle) {
+            g_ui.nid.hIcon = idleTrayIcon();
+            modifyTray = true;
+        }
     }
     if (gpuAvail >= 0) {
         g_ui.gpuAvailable = (gpuAvail == 1);
@@ -1279,7 +1388,6 @@ private void flushPendingUi(HWND hwnd) {
         KillTimer(hwnd, ID_TIMER_CLICK);
     }
 
-    bool modifyTray = false;
     if (hasStatus) {
         SetWindowTextW(g_ui.lblStatus, status.toUTF16z());
         setTrayTip("Shepot — " ~ status);
@@ -1288,7 +1396,7 @@ private void flushPendingUi(HWND hwnd) {
     if (visState >= 0) {
         g_ui.hudState = cast(VisualState) visState;
         final switch (g_ui.hudState) {
-            case VisualState.idle:       g_ui.nid.hIcon = g_ui.iconSmall; break;
+            case VisualState.idle:       g_ui.nid.hIcon = idleTrayIcon(); break;
             case VisualState.recording:  g_ui.nid.hIcon = g_ui.iconRec; break;
             case VisualState.processing: g_ui.nid.hIcon = g_ui.iconProc; break;
             case VisualState.pasted:     g_ui.nid.hIcon = g_ui.iconPasted; break;
@@ -1340,6 +1448,7 @@ private void applyModelSelection(int idx) {
     if (idx < 0 || idx >= cast(int) g_ui.modelOptions.length) return;
     g_ui.currentModel = g_ui.modelOptions[idx].value;
     SendMessageW(g_ui.comboModel, CB_SETCURSEL, idx, 0);
+    refreshModelHint();
     if (g_ui.onModelSelect !is null) g_ui.onModelSelect(g_ui.currentModel);
 }
 
@@ -1404,6 +1513,366 @@ private void applyToggleMode(bool checked) {
     if (!g_ui.isDown && !g_ui.modelLoading) uiSetIdleStatus(g_ui.modelLoaded);
 }
 
+private void applyOverwriteClip(bool checked) {
+    g_ui.overwriteNonTextClip = checked;
+    SendMessageW(g_ui.chkOverwriteClip, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_ui.onOverwriteClipChange !is null) g_ui.onOverwriteClipChange(checked);
+}
+
+private void applyThemeSelection(int idx) {
+    if (idx < 0 || idx >= cast(int) themeOptions.length) return;
+    g_ui.currentTheme = themeOptions[idx].value;
+    SendMessageW(g_ui.comboTheme, CB_SETCURSEL, idx, 0);
+    applyWindowTheme(g_ui.hwnd);
+    if (g_ui.onThemeChange !is null) g_ui.onThemeChange(g_ui.currentTheme);
+}
+
+private bool isWindowsDarkTheme() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"w.ptr,
+            0, KEY_READ, &hKey) != ERROR_SUCCESS)
+    {
+        return false;
+    }
+    scope (exit) RegCloseKey(hKey);
+
+    DWORD val = 1;
+    DWORD sz = DWORD.sizeof;
+    DWORD typ = 0;
+    if (RegQueryValueExW(hKey, "AppsUseLightTheme"w.ptr, null, &typ, cast(ubyte*) &val, &sz) == ERROR_SUCCESS
+        && typ == REG_DWORD)
+    {
+        return val == 0;
+    }
+    return false;
+}
+
+private void applyWindowTheme(HWND hwnd) {
+    if (hwnd is null) return;
+    bool dark = (g_ui.currentTheme == "dark") || (g_ui.currentTheme == "auto" && isWindowsDarkTheme());
+    g_ui.darkActive = dark;
+
+    if (auto hDwm = LoadLibraryW("dwmapi.dll"w.ptr)) {
+        scope (exit) FreeLibrary(hDwm);
+        alias FnDwmSet = extern (Windows) HRESULT function(HWND, DWORD, const(void)*, DWORD);
+        if (auto pSet = cast(FnDwmSet) GetProcAddress(hDwm, "DwmSetWindowAttribute")) {
+            BOOL useDark = dark ? TRUE : FALSE;
+            if (pSet(hwnd, 20, &useDark, BOOL.sizeof) != 0) {
+                pSet(hwnd, 19, &useDark, BOOL.sizeof);
+            }
+        }
+    }
+
+    if (auto hUx = LoadLibraryW("uxtheme.dll"w.ptr)) {
+        scope (exit) FreeLibrary(hUx);
+        alias FnSetTheme = extern (Windows) HRESULT function(HWND, const(wchar)*, const(wchar)*);
+        if (auto pTheme = cast(FnSetTheme) GetProcAddress(hUx, "SetWindowTheme")) {
+            auto expName = dark ? "DarkMode_Explorer"w.ptr : null;
+            auto cfdName = dark ? "DarkMode_CFD"w.ptr : null;
+            auto emptyOrNull = dark ? ""w.ptr : null;
+
+            foreach (c; [
+                g_ui.btnNavMain, g_ui.btnNavSettings, g_ui.btnHide, g_ui.btnModel,
+                g_ui.btnBrowseModel, g_ui.btnCopyLast, g_ui.btnClearLog,
+                g_ui.btnHotkey, g_ui.btnOpenReplacements, g_ui.btnOpenModelsDir,
+                g_ui.editLog, g_ui.hwndTip,
+            ]) {
+                if (c !is null) pTheme(c, expName, null);
+            }
+            foreach (c; [
+                g_ui.comboMic, g_ui.comboModel, g_ui.comboLang,
+                g_ui.comboTimeout, g_ui.comboInputMode, g_ui.comboTheme,
+            ]) {
+                if (c !is null) pTheme(c, cfdName, null);
+            }
+            foreach (c; [
+                g_ui.lblStatus, g_ui.lblModel, g_ui.lblModelHint, g_ui.lblLog, g_ui.lblMic,
+                g_ui.lblLang, g_ui.lblHotkey, g_ui.lblTimeout, g_ui.lblInputMode, g_ui.lblTheme,
+            ]) {
+                if (c !is null) pTheme(c, dark ? ""w.ptr : null, dark ? ""w.ptr : null);
+            }
+            foreach (c; [
+                g_ui.chkAutoLoad, g_ui.chkCpuOnly, g_ui.chkStartTray, g_ui.chkWinAuto,
+                g_ui.chkLivePreview, g_ui.chkOverlay, g_ui.chkToggleMode, g_ui.chkOverwriteClip,
+            ]) {
+                if (c !is null) pTheme(c, null, null);
+            }
+        }
+    }
+
+    SetWindowPos(hwnd, null, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    RedrawWindow(hwnd, null, null, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+}
+
+private void setActivePage(int page) {
+    g_ui.activePage = page;
+    SendMessageW(g_ui.btnNavMain, BM_SETCHECK, page == 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_ui.btnNavSettings, BM_SETCHECK, page == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    int swMain = (page == 0) ? SW_SHOW : SW_HIDE;
+    int swSet = (page == 1) ? SW_SHOW : SW_HIDE;
+    foreach (c; [
+        g_ui.lblStatus, g_ui.btnModel, g_ui.progressBar,
+        g_ui.lblModel, g_ui.comboModel, g_ui.btnBrowseModel, g_ui.lblModelHint,
+        g_ui.lblLog, g_ui.btnCopyLast, g_ui.btnClearLog, g_ui.editLog,
+    ]) {
+        if (c !is null) ShowWindow(c, swMain);
+    }
+    foreach (c; [
+        g_ui.lblMic, g_ui.comboMic, g_ui.lblLang, g_ui.comboLang,
+        g_ui.lblHotkey, g_ui.btnHotkey, g_ui.lblTimeout, g_ui.comboTimeout,
+        g_ui.lblInputMode, g_ui.comboInputMode, g_ui.lblTheme, g_ui.comboTheme,
+        g_ui.chkAutoLoad, g_ui.chkCpuOnly, g_ui.chkStartTray, g_ui.chkWinAuto,
+        g_ui.chkLivePreview, g_ui.chkOverlay, g_ui.chkToggleMode, g_ui.chkOverwriteClip,
+        g_ui.btnOpenReplacements, g_ui.btnOpenModelsDir,
+    ]) {
+        if (c !is null) ShowWindow(c, swSet);
+    }
+    InvalidateRect(g_ui.hwnd, null, TRUE);
+}
+
+private void openReplacementsFile(HWND hwnd) {
+    auto path = buildPath(dirName(thisExePath()), "replacements.json");
+    if (!exists(path)) {
+        try {
+            write(path, "{\n  \"вишпер\": \"Whisper\"\n}\n");
+        } catch (Exception) {
+        }
+    }
+    ShellExecuteW(hwnd, "open"w.ptr, path.toUTF16z(), null, null, SW_SHOWNORMAL);
+}
+
+private void openModelsDir(HWND hwnd) {
+    auto path = buildPath(dirName(thisExePath()), "models");
+    try {
+        mkdirRecurse(path);
+    } catch (Exception) {
+    }
+    ShellExecuteW(hwnd, "open"w.ptr, path.toUTF16z(), null, null, SW_SHOWNORMAL);
+}
+
+private void drawNativeCheckBox(HWND hwnd, HDC hdc, const ref RECT boxRc, bool checked, bool enabled) nothrow {
+    alias FnOpenTheme = extern (Windows) HANDLE function(HWND, const(wchar)*) nothrow;
+    alias FnCloseTheme = extern (Windows) HRESULT function(HANDLE) nothrow;
+    alias FnDrawThemeBg = extern (Windows) HRESULT function(HANDLE, HDC, int, int, const(RECT)*, const(RECT)*) nothrow;
+    alias FnPartSize = extern (Windows) HRESULT function(HANDLE, HDC, int, int, const(RECT)*, int, SIZE*) nothrow;
+
+    static HMODULE hUx = null;
+    static FnOpenTheme pOpen = null;
+    static FnCloseTheme pClose = null;
+    static FnDrawThemeBg pDraw = null;
+    static FnPartSize pSize = null;
+    static bool loaded = false;
+
+    if (!loaded) {
+        loaded = true;
+        hUx = LoadLibraryW("uxtheme.dll"w.ptr);
+        if (hUx !is null) {
+            pOpen = cast(FnOpenTheme) GetProcAddress(hUx, "OpenThemeData");
+            pClose = cast(FnCloseTheme) GetProcAddress(hUx, "CloseThemeData");
+            pDraw = cast(FnDrawThemeBg) GetProcAddress(hUx, "DrawThemeBackground");
+            pSize = cast(FnPartSize) GetProcAddress(hUx, "GetThemePartSize");
+        }
+    }
+
+    RECT r = boxRc;
+    HANDLE hTheme = (pOpen !is null) ? pOpen(hwnd, "Button"w.ptr) : null;
+    scope (exit) {
+        if (hTheme !is null && pClose !is null) pClose(hTheme);
+    }
+
+    if (hTheme !is null && pSize !is null) {
+        SIZE sz;
+        if (pSize(hTheme, hdc, 3, 5, null, 1, &sz) == 0 && sz.cx > 0 && sz.cy > 0) {
+            int midY = (boxRc.top + boxRc.bottom) / 2;
+            r = RECT(boxRc.left, midY - sz.cy / 2, boxRc.left + sz.cx, midY - sz.cy / 2 + sz.cy);
+        }
+    }
+
+    if (checked && hTheme !is null && pDraw !is null) {
+        // BP_CHECKBOX = 3; CBS_CHECKEDNORMAL = 5, CBS_CHECKEDDISABLED = 8
+        pDraw(hTheme, hdc, 3, enabled ? 5 : 8, &r, null);
+        return;
+    }
+
+    COLORREF boxFill = checked
+        ? (enabled ? RGB(0, 120, 212) : RGB(68, 68, 76))
+        : RGB(30, 30, 36);
+    COLORREF boxBorder = checked
+        ? boxFill
+        : (enabled ? RGB(138, 138, 150) : RGB(78, 78, 86));
+    HBRUSH br = CreateSolidBrush(boxFill);
+    HPEN pen = CreatePen(PS_SOLID, 1, boxBorder);
+    auto oldBr = SelectObject(hdc, br);
+    auto oldPen = SelectObject(hdc, pen);
+    RoundRect(hdc, r.left, r.top, r.right, r.bottom, 4, 4);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBr);
+    DeleteObject(pen);
+    DeleteObject(br);
+}
+
+private extern (Windows) LRESULT darkButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow {
+    if (g_ui.darkActive && (msg == WM_PAINT || msg == WM_ERASEBKGND)) {
+        int btnId = GetDlgCtrlID(hwnd);
+        bool isNav = (btnId == ID_NAV_MAIN || btnId == ID_NAV_SETTINGS);
+        bool checked = CallWindowProcW(g_origBtnProc, hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+        // Невыбранную кнопку навигации рисует сама Windows — 1-в-1 как «Скрыть в трей».
+        if (isNav && !checked) {
+            return CallWindowProcW(g_origBtnProc, hwnd, msg, wParam, lParam);
+        }
+
+        if (msg == WM_ERASEBKGND) return 1;
+        try {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, g_ui.darkBgBrush);
+
+            bool enabled = IsWindowEnabled(hwnd) != 0;
+            wchar[128] txt = 0;
+            int tlen = GetWindowTextW(hwnd, txt.ptr, cast(int) txt.length);
+            auto oldFont = SelectObject(hdc, g_ui.fontUi);
+            SetBkMode(hdc, TRANSPARENT);
+
+            if (isNav) {
+                HBRUSH br = CreateSolidBrush(RGB(34, 62, 100));
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(66, 135, 245));
+                auto oldBr = SelectObject(hdc, br);
+                auto oldPen = SelectObject(hdc, pen);
+                RoundRect(hdc, 0, 0, rc.right, rc.bottom, 6, 6);
+                SelectObject(hdc, oldPen);
+                SelectObject(hdc, oldBr);
+                DeleteObject(pen);
+                DeleteObject(br);
+
+                SetTextColor(hdc, RGB(255, 255, 255));
+                DrawTextW(hdc, txt.ptr, tlen, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                int box = 14;
+                int by = ((rc.bottom - rc.top) - box) / 2;
+                RECT boxRc = RECT(0, by, box, by + box);
+                drawNativeCheckBox(hwnd, hdc, boxRc, checked, enabled);
+
+                RECT tr = RECT(20, rc.top, rc.right, rc.bottom);
+                SetTextColor(hdc, enabled ? RGB(244, 244, 245) : RGB(118, 118, 128));
+                DrawTextW(hdc, txt.ptr, tlen, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            }
+
+            SelectObject(hdc, oldFont);
+            EndPaint(hwnd, &ps);
+            return 0;
+        } catch (Throwable) {
+        }
+    }
+    return CallWindowProcW(g_origBtnProc, hwnd, msg, wParam, lParam);
+}
+
+private void setTooltipText(HWND parent, HWND tip, HWND ctrl, string text, bool add) nothrow {
+    if (tip is null || ctrl is null) return;
+    try {
+        TOOLINFOW ti;
+        ti.cbSize = TOOLINFOW.sizeof;
+        ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        ti.hwnd = parent;
+        ti.uId = cast(UINT_PTR) ctrl;
+        ti.lpszText = cast(wchar*) text.toUTF16z();
+        SendMessageW(tip, add ? TTM_ADDTOOLW : TTM_UPDATETIPTEXTW, 0, cast(LPARAM) &ti);
+    } catch (Throwable) {
+    }
+}
+
+private void refreshModelHint(int idxOverride = -1) nothrow {
+    try {
+        UiOption opt;
+        bool found = false;
+        if (idxOverride >= 0 && idxOverride < cast(int) g_ui.modelOptions.length) {
+            opt = g_ui.modelOptions[idxOverride];
+            found = true;
+        } else {
+            foreach (o; g_ui.modelOptions) {
+                if (o.value == g_ui.currentModel) {
+                    opt = o;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        string hint = (found && opt.hint.length > 0)
+            ? opt.hint
+            : "Пользовательская модель (выбрана из локального файла).";
+        if (g_ui.lblModelHint !is null) {
+            SetWindowTextW(g_ui.lblModelHint, ("Рекомендация: " ~ hint).toUTF16z());
+        }
+        if (g_ui.hwndTip !is null && g_ui.comboModel !is null) {
+            string tip = found ? (opt.label ~ "\r\n" ~ hint) : hint;
+            setTooltipText(g_ui.hwnd, g_ui.hwndTip, g_ui.comboModel, tip, false);
+        }
+    } catch (Throwable) {
+    }
+}
+
+private extern (Windows) LRESULT comboListHoverProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow {
+    LRESULT res = CallWindowProcW(g_origListProc, hwnd, msg, wParam, lParam);
+    if (msg == WM_MOUSEMOVE) {
+        int hovered = cast(int) CallWindowProcW(g_origListProc, hwnd, LB_GETCURSEL, 0, 0);
+        if (hovered >= 0 && hovered < cast(int) g_ui.modelOptions.length && hovered != g_ui.lastHoveredModelIdx) {
+            g_ui.lastHoveredModelIdx = hovered;
+            refreshModelHint(hovered);
+        }
+    }
+    return res;
+}
+
+private void installAllTooltips(HWND hwnd) {
+    g_ui.hwndTip = CreateWindowExW(
+        WS_EX_TOPMOST, TOOLTIPS_CLASS.toUTF16z(), null,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        hwnd, null, GetModuleHandleW(null), null
+    );
+    if (g_ui.hwndTip is null) return;
+
+    SendMessageW(g_ui.hwndTip, TTM_SETMAXTIPWIDTH, 0, 360);
+    SendMessageW(g_ui.hwndTip, TTM_SETDELAYTIME, TTDT_INITIAL, 350);
+    SendMessageW(g_ui.hwndTip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 15000);
+
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnNavMain, "Главная страница: статус, модель и журнал распознавания.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnNavSettings, "Настройки микрофона, языка, клавиши, ввода и темы.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnHide, "Свернуть окно в системный трей (программа продолжит работать).", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnModel, "Загрузить выбранную модель в память (RAM/VRAM) или выгрузить её для освобождения памяти.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboModel, "Выбор нейросети распознавания. При наведении на пункт списка ниже показывается рекомендация.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnBrowseModel, "Указать свою локальную модель: файл Whisper (.bin) или файл/папку sherpa-onnx (.onnx / tokens.txt).", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnCopyLast, "Скопировать последнюю распознанную фразу в буфер обмена.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnClearLog, "Очистить текстовый журнал работы в этом окне.", true);
+
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboMic, "Выбор микрофона для записи (по умолчанию используется устройство записи Windows).", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboLang, "Ожидаемый язык речи (для Whisper и части ONNX-моделей; «auto» определяет язык автоматически).", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnHotkey, "Нажмите и затем нажмите нужную клавишу или кнопку мыши (MOUSE4/MOUSE5 и др.) для записи.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboTimeout, "Через сколько минут бездействия выгружать модель из памяти для экономии VRAM/RAM.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboInputMode, "Посимвольно — для игр и окон без Ctrl+V;\r\nБуфер обмена — мгновенная вставка;\r\nАвто — до 80 симв. посимвольно, длиннее через буфер.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboTheme, "Выбор оформления окна: Авто (следует теме Windows), Светлая или Тёмная.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkAutoLoad, "Автоматически загружать модель при запуске Shepot.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkCpuOnly, "Запускать Whisper на процессоре вместо видеокарты (недоступно для движков без GPU).", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkStartTray, "Запускать программу сразу свёрнутой в системный трей.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkWinAuto, "Автоматически запускать Shepot при входе в Windows.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkLivePreview, "Показывать промежуточный текст в плавающем HUD-индикаторе прямо во время диктовки.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkOverlay, "Небольшой плавающий индикатор статуса записи внизу экрана.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkToggleMode, "Нажал — идёт запись, нажал повторно — остановка (вместо удержания кнопки).", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.chkOverwriteClip, "Если выкл.: при наличии картинки/файлов в буфере обмена текст введётся посимвольно без потери картинки.\r\nЕсли вкл.: всегда вставлять через Ctrl+V.", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnOpenReplacements, "Открыть файл автозамен bin/replacements.json (создаёт шаблон при первом открытии).", true);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnOpenModelsDir, "Открыть папку bin/models/ в Проводнике для добавления своих моделей.", true);
+}
+
+private void installDarkButtonSubclass(HWND ctrl) {
+    if (ctrl is null) return;
+    auto prev = cast(WNDPROC) SetWindowLongPtrW(ctrl, GWLP_WNDPROC, cast(LONG_PTR) &darkButtonProc);
+    if (g_origBtnProc is null) g_origBtnProc = prev;
+}
+
 private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow {
     try {
         switch (msg) {
@@ -1412,8 +1881,18 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 g_ui.fontTitle = makeFont("Segoe UI", -17, FW_SEMIBOLD);
                 g_ui.fontBtnBold = makeFont("Segoe UI", -15, FW_SEMIBOLD);
                 g_ui.fontUi = makeFont("Segoe UI", -14, FW_NORMAL);
+                g_ui.fontHint = makeFont("Segoe UI", -12, FW_NORMAL);
                 g_ui.fontMono = makeFont("Consolas", -13, FW_NORMAL);
+                g_ui.darkBgBrush = CreateSolidBrush(RGB(24, 24, 27));
+                g_ui.darkEditBrush = CreateSolidBrush(RGB(15, 15, 18));
+                g_ui.darkSurfaceBrush = CreateSolidBrush(RGB(32, 32, 37));
 
+                g_ui.btnNavMain = CreateWindowExW(0, "BUTTON"w.ptr, "Главная"w.ptr,
+                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | BS_PUSHLIKE | WS_GROUP,
+                    0, 0, 0, 0, hwnd, cast(HMENU) cast(size_t) ID_NAV_MAIN, hInst, null);
+                g_ui.btnNavSettings = CreateWindowExW(0, "BUTTON"w.ptr, "Настройки"w.ptr,
+                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | BS_PUSHLIKE,
+                    0, 0, 0, 0, hwnd, cast(HMENU) cast(size_t) ID_NAV_SETTINGS, hInst, null);
                 g_ui.lblStatus = CreateWindowExW(0, "STATIC"w.ptr, "Инициализация..."w.ptr,
                     WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.btnHide = CreateWindowExW(0, "BUTTON"w.ptr, "Скрыть в трей"w.ptr,
@@ -1441,6 +1920,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 g_ui.btnBrowseModel = CreateWindowExW(0, "BUTTON"w.ptr, "Обзор..."w.ptr,
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_BROWSE_MODEL, hInst, null);
+                g_ui.lblModelHint = CreateWindowExW(0, "STATIC"w.ptr, ""w.ptr,
+                    WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
 
                 g_ui.lblLang = CreateWindowExW(0, "STATIC"w.ptr, "Язык речи:"w.ptr,
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
@@ -1454,7 +1935,7 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_HOTKEY, hInst, null);
 
-                g_ui.lblTimeout = CreateWindowExW(0, "STATIC"w.ptr, "Автовыгрузка (VRAM):"w.ptr,
+                g_ui.lblTimeout = CreateWindowExW(0, "STATIC"w.ptr, "Автовыгрузка (память):"w.ptr,
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.comboTimeout = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
@@ -1465,6 +1946,12 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 g_ui.comboInputMode = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_INPUT_MODE, hInst, null);
+
+                g_ui.lblTheme = CreateWindowExW(0, "STATIC"w.ptr, "Тема оформления:"w.ptr,
+                    WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
+                g_ui.comboTheme = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
+                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_COMBO_THEME, hInst, null);
 
                 g_ui.chkAutoLoad = CreateWindowExW(0, "BUTTON"w.ptr, "Автозагрузка модели"w.ptr,
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
@@ -1487,9 +1974,26 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 g_ui.chkToggleMode = CreateWindowExW(0, "BUTTON"w.ptr, "Режим переключения (Toggle)"w.ptr,
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_TOGGLE_MODE, hInst, null);
+                g_ui.chkOverwriteClip = CreateWindowExW(0, "BUTTON"w.ptr, "Заменять нетекстовый буфер"w.ptr,
+                    WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_CHK_OVERWRITE_CLIP, hInst, null);
+
+                g_ui.btnOpenReplacements = CreateWindowExW(0, "BUTTON"w.ptr, "Словарь замен (replacements.json)"w.ptr,
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_BTN_OPEN_REPL, hInst, null);
+                g_ui.btnOpenModelsDir = CreateWindowExW(0, "BUTTON"w.ptr, "Открыть папку моделей"w.ptr,
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_BTN_OPEN_MODELS, hInst, null);
 
                 g_ui.lblLog = CreateWindowExW(0, "STATIC"w.ptr, "Журнал работы:"w.ptr,
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
+                g_ui.btnCopyLast = CreateWindowExW(0, "BUTTON"w.ptr, "Копировать фразу"w.ptr,
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_BTN_COPY_LAST, hInst, null);
+                EnableWindow(g_ui.btnCopyLast, FALSE);
+                g_ui.btnClearLog = CreateWindowExW(0, "BUTTON"w.ptr, "Очистить"w.ptr,
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_BTN_CLEAR_LOG, hInst, null);
                 g_ui.editLog = CreateWindowExW(WS_EX_CLIENTEDGE, "EDIT"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
                     0, 0, 0, 0, hwnd, cast(HMENU) cast(size_t) ID_EDIT_LOG, hInst, null);
@@ -1497,16 +2001,36 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 SendMessageW(g_ui.lblStatus, WM_SETFONT, cast(WPARAM) g_ui.fontTitle, TRUE);
                 SendMessageW(g_ui.btnModel, WM_SETFONT, cast(WPARAM) g_ui.fontBtnBold, TRUE);
                 foreach (ctrl; [
+                    g_ui.btnNavMain, g_ui.btnNavSettings,
                     g_ui.btnHide, g_ui.lblMic, g_ui.comboMic, g_ui.lblModel, g_ui.comboModel,
                     g_ui.btnBrowseModel, g_ui.lblLang, g_ui.comboLang, g_ui.lblHotkey, g_ui.btnHotkey,
                     g_ui.lblTimeout, g_ui.comboTimeout, g_ui.lblInputMode, g_ui.comboInputMode,
+                    g_ui.lblTheme, g_ui.comboTheme,
                     g_ui.chkAutoLoad, g_ui.chkCpuOnly,
                     g_ui.chkStartTray, g_ui.chkWinAuto, g_ui.chkLivePreview, g_ui.chkOverlay,
-                    g_ui.chkToggleMode, g_ui.lblLog
+                    g_ui.chkToggleMode, g_ui.chkOverwriteClip,
+                    g_ui.btnOpenReplacements, g_ui.btnOpenModelsDir,
+                    g_ui.lblLog, g_ui.btnCopyLast, g_ui.btnClearLog
                 ]) {
                     SendMessageW(ctrl, WM_SETFONT, cast(WPARAM) g_ui.fontUi, TRUE);
                 }
+                SendMessageW(g_ui.lblModelHint, WM_SETFONT, cast(WPARAM) g_ui.fontHint, TRUE);
                 SendMessageW(g_ui.editLog, WM_SETFONT, cast(WPARAM) g_ui.fontMono, TRUE);
+
+                COMBOBOXINFO cbi;
+                cbi.cbSize = COMBOBOXINFO.sizeof;
+                if (GetComboBoxInfo(g_ui.comboModel, &cbi) && cbi.hwndList !is null) {
+                    g_ui.comboModelList = cbi.hwndList;
+                    g_origListProc = cast(WNDPROC) SetWindowLongPtrW(cbi.hwndList, GWLP_WNDPROC, cast(LONG_PTR) &comboListHoverProc);
+                }
+                installAllTooltips(hwnd);
+                foreach (c; [
+                    g_ui.btnNavMain, g_ui.btnNavSettings,
+                    g_ui.chkAutoLoad, g_ui.chkCpuOnly, g_ui.chkStartTray, g_ui.chkWinAuto,
+                    g_ui.chkLivePreview, g_ui.chkOverlay, g_ui.chkToggleMode, g_ui.chkOverwriteClip,
+                ]) {
+                    installDarkButtonSubclass(c);
+                }
 
                 RECT rc;
                 GetClientRect(hwnd, &rc);
@@ -1516,22 +2040,68 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 SetTimer(hwnd, ID_TIMER_PREVIEW, 1100, null);
                 return 0;
 
+            case WM_ERASEBKGND:
+                if (g_ui.darkActive && g_ui.darkBgBrush !is null) {
+                    RECT bgRc;
+                    GetClientRect(hwnd, &bgRc);
+                    FillRect(cast(HDC) wParam, &bgRc, g_ui.darkBgBrush);
+                    return 1;
+                }
+                break;
+
             case WM_CTLCOLORSTATIC:
                 auto hdc = cast(HDC) wParam;
                 if (cast(HWND) lParam == g_ui.editLog) {
+                    if (g_ui.darkActive && g_ui.darkEditBrush !is null) {
+                        SetTextColor(hdc, RGB(236, 236, 240));
+                        SetBkColor(hdc, RGB(15, 15, 18));
+                        return cast(LRESULT) g_ui.darkEditBrush;
+                    }
+                    SetTextColor(hdc, RGB(24, 28, 36));
                     SetBkColor(hdc, RGB(255, 255, 255));
                     return cast(LRESULT) GetSysColorBrush(COLOR_WINDOW);
                 }
                 SetBkMode(hdc, TRANSPARENT);
+                if (g_ui.darkActive && g_ui.darkBgBrush !is null) {
+                    COLORREF fg = RGB(228, 228, 234);
+                    if (cast(HWND) lParam == g_ui.lblStatus) fg = RGB(250, 250, 252);
+                    else if (cast(HWND) lParam == g_ui.lblModelHint) fg = RGB(162, 168, 180);
+                    SetTextColor(hdc, fg);
+                    return cast(LRESULT) g_ui.darkBgBrush;
+                }
                 if (cast(HWND) lParam == g_ui.lblStatus) {
                     SetTextColor(hdc, RGB(24, 34, 56));
+                } else if (cast(HWND) lParam == g_ui.lblModelHint) {
+                    SetTextColor(hdc, RGB(82, 92, 108));
                 }
                 return cast(LRESULT) GetSysColorBrush(COLOR_BTNFACE);
 
+            case WM_CTLCOLOREDIT:
+            case WM_CTLCOLORLISTBOX:
+                if (g_ui.darkActive && g_ui.darkSurfaceBrush !is null) {
+                    auto hdc = cast(HDC) wParam;
+                    SetTextColor(hdc, RGB(240, 240, 244));
+                    SetBkColor(hdc, RGB(32, 32, 37));
+                    return cast(LRESULT) g_ui.darkSurfaceBrush;
+                }
+                break;
+
+            case WM_CTLCOLORBTN:
+                if (g_ui.darkActive && g_ui.darkBgBrush !is null) {
+                    return cast(LRESULT) g_ui.darkBgBrush;
+                }
+                break;
+
+            case WM_WININICHANGE:
+                if (g_ui.currentTheme == "auto") {
+                    applyWindowTheme(hwnd);
+                }
+                return 0;
+
             case WM_GETMINMAXINFO:
                 auto mmi = cast(MINMAXINFO*) lParam;
-                mmi.ptMinTrackSize.x = 520;
-                mmi.ptMinTrackSize.y = 570;
+                mmi.ptMinTrackSize.x = 500;
+                mmi.ptMinTrackSize.y = 500;
                 return 0;
 
             case WM_SIZE:
@@ -1551,7 +2121,7 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     KillTimer(hwnd, ID_TIMER_HUD_HIDE);
                     if (g_ui.hudWnd !is null) ShowWindow(g_ui.hudWnd, SW_HIDE);
                     g_ui.hudState = VisualState.idle;
-                    g_ui.nid.hIcon = g_ui.iconSmall;
+                    g_ui.nid.hIcon = idleTrayIcon();
                     Shell_NotifyIconW(NIM_MODIFY, &g_ui.nid);
                 } else if (wParam == ID_TIMER_PREVIEW) {
                     if (g_ui.isDown && g_ui.livePreview && g_ui.modelLoaded && !g_ui.modelLoading && g_ui.onPreviewTick !is null) {
@@ -1563,12 +2133,22 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
             case WM_COMMAND:
                 int id = cast(int)(wParam & 0xFFFF);
                 int code = cast(int)((wParam >> 16) & 0xFFFF);
-                if (id == ID_BTN_HIDE || id == ID_TRAY_TOGGLE) {
+                if (id == ID_NAV_MAIN) {
+                    setActivePage(0);
+                } else if (id == ID_NAV_SETTINGS) {
+                    setActivePage(1);
+                } else if (id == ID_BTN_HIDE || id == ID_TRAY_TOGGLE) {
                     toggleWindowVisibility(hwnd);
                 } else if (id == ID_BTN_MODEL || id == ID_TRAY_MODEL_TOGGLE) {
                     if (g_ui.onModelToggle !is null) g_ui.onModelToggle();
                 } else if (id == ID_BTN_BROWSE_MODEL || id == ID_TRAY_BROWSE_MODEL) {
                     openCustomModelDialog(hwnd);
+                } else if (id == ID_BTN_CLEAR_LOG) {
+                    SetWindowTextW(g_ui.editLog, ""w.ptr);
+                } else if (id == ID_BTN_OPEN_REPL) {
+                    openReplacementsFile(hwnd);
+                } else if (id == ID_BTN_OPEN_MODELS) {
+                    openModelsDir(hwnd);
                 } else if (id == ID_BTN_HOTKEY || id == ID_TRAY_HOTKEY) {
                     g_ui.capturingHotkey = true;
                     SetWindowTextW(g_ui.btnHotkey, "Нажмите клавишу или кнопку мыши (Esc — отмена)..."w.ptr);
@@ -1586,7 +2166,9 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyLivePreview(!g_ui.livePreview);
                 } else if (id == ID_TRAY_TOGGLE_MODE) {
                     applyToggleMode(!g_ui.toggleMode);
-                } else if (id == ID_TRAY_COPY_LAST) {
+                } else if (id == ID_TRAY_OVERWRITE_CLIP) {
+                    applyOverwriteClip(!g_ui.overwriteNonTextClip);
+                } else if (id == ID_TRAY_COPY_LAST || id == ID_BTN_COPY_LAST) {
                     if (copyTextToClipboard(g_ui.lastPhrase)) {
                         uiLog("[CLIP] Скопирована последняя фраза: " ~ g_ui.lastPhrase);
                         uiSetVisual(VisualState.pasted, "Скопировано в буфер", 900);
@@ -1602,19 +2184,27 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyLangSelection(id - ID_TRAY_LANG_BASE);
                 } else if (id >= ID_TRAY_TIMEOUT_BASE && id < ID_TRAY_INPUT_MODE_BASE) {
                     applyTimeoutSelection(id - ID_TRAY_TIMEOUT_BASE);
-                } else if (id >= ID_TRAY_INPUT_MODE_BASE && id < ID_TRAY_INPUT_MODE_BASE + 100) {
+                } else if (id >= ID_TRAY_INPUT_MODE_BASE && id < ID_TRAY_THEME_BASE) {
                     applyInputModeSelection(id - ID_TRAY_INPUT_MODE_BASE);
+                } else if (id >= ID_TRAY_THEME_BASE && id < ID_TRAY_THEME_BASE + 100) {
+                    applyThemeSelection(id - ID_TRAY_THEME_BASE);
                 } else if (id == ID_COMBO_MIC && code == CBN_SELCHANGE) {
                     int sel = cast(int) SendMessageW(g_ui.comboMic, CB_GETCURSEL, 0, 0);
                     applyMicSelection(sel <= 0 ? -1 : sel - 1);
                 } else if (id == ID_COMBO_MODEL && code == CBN_SELCHANGE) {
+                    g_ui.lastHoveredModelIdx = -1;
                     applyModelSelection(cast(int) SendMessageW(g_ui.comboModel, CB_GETCURSEL, 0, 0));
+                } else if (id == ID_COMBO_MODEL && code == CBN_CLOSEUP) {
+                    g_ui.lastHoveredModelIdx = -1;
+                    refreshModelHint();
                 } else if (id == ID_COMBO_LANG && code == CBN_SELCHANGE) {
                     applyLangSelection(cast(int) SendMessageW(g_ui.comboLang, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_COMBO_TIMEOUT && code == CBN_SELCHANGE) {
                     applyTimeoutSelection(cast(int) SendMessageW(g_ui.comboTimeout, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_COMBO_INPUT_MODE && code == CBN_SELCHANGE) {
                     applyInputModeSelection(cast(int) SendMessageW(g_ui.comboInputMode, CB_GETCURSEL, 0, 0));
+                } else if (id == ID_COMBO_THEME && code == CBN_SELCHANGE) {
+                    applyThemeSelection(cast(int) SendMessageW(g_ui.comboTheme, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_CHK_AUTOLOAD) {
                     bool checked = SendMessageW(g_ui.chkAutoLoad, BM_GETCHECK, 0, 0) == BST_CHECKED;
                     if (g_ui.onAutoLoadChange !is null) g_ui.onAutoLoadChange(checked);
@@ -1631,6 +2221,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyOverlay(SendMessageW(g_ui.chkOverlay, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 } else if (id == ID_CHK_TOGGLE_MODE) {
                     applyToggleMode(SendMessageW(g_ui.chkToggleMode, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                } else if (id == ID_CHK_OVERWRITE_CLIP) {
+                    applyOverwriteClip(SendMessageW(g_ui.chkOverwriteClip, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 }
                 return 0;
 
@@ -1660,10 +2252,13 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     g_ui.hudWnd = null;
                 }
                 Shell_NotifyIconW(NIM_DELETE, &g_ui.nid);
-                foreach (f; [g_ui.fontTitle, g_ui.fontBtnBold, g_ui.fontUi, g_ui.fontMono]) {
+                foreach (f; [g_ui.fontTitle, g_ui.fontBtnBold, g_ui.fontUi, g_ui.fontHint, g_ui.fontMono]) {
                     if (f !is null) DeleteObject(f);
                 }
-                foreach (ic; [g_ui.iconBig, g_ui.iconSmall, g_ui.iconRec, g_ui.iconProc, g_ui.iconPasted]) {
+                foreach (br; [g_ui.darkBgBrush, g_ui.darkEditBrush, g_ui.darkSurfaceBrush]) {
+                    if (br !is null) DeleteObject(br);
+                }
+                foreach (ic; [g_ui.iconBig, g_ui.iconSmall, g_ui.iconUnloaded, g_ui.iconRec, g_ui.iconProc, g_ui.iconPasted]) {
                     if (ic !is null) DestroyIcon(ic);
                 }
                 PostQuitMessage(0);

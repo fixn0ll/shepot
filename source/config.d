@@ -35,6 +35,8 @@ struct AppConfig {
     string inputMode = "sendinput";
     int charDelayMs = 3;
     int clipboardRestoreDelayMs = 120;
+    bool overwriteNonTextClipboard = false;
+    string theme = "auto";
     bool beep = true;
     bool showOverlay = true;
     bool livePreview = true;
@@ -51,18 +53,59 @@ string normalizeEngine(string engine) {
 struct ModelPresetInfo {
     string id;
     string label;
+    string hint;
 }
 
 static immutable ModelPresetInfo[] builtinModelPresets = [
-    ModelPresetInfo("sherpa:gigaam-v3-punct", "GigaAM v3 RNN-T Punct (RU + пунктуация, CPU)"),
-    ModelPresetInfo("sherpa:gigaam-multilingual", "GigaAM Multilingual CTC (RU + EN, CPU)"),
-    ModelPresetInfo("whisper:models/ggml-tiny.bin", "Whisper tiny (~75 МБ, сверхбыстрая)"),
-    ModelPresetInfo("whisper:models/ggml-base.bin", "Whisper base (~142 МБ, быстрая)"),
-    ModelPresetInfo("whisper:models/ggml-small-q5_1.bin", "Whisper small-q5_1 (~182 МБ, лёгкая для CPU)"),
-    ModelPresetInfo("whisper:models/ggml-medium-q5_0.bin", "Whisper medium-q5_0 (~515 МБ, баланс)"),
-    ModelPresetInfo("whisper:models/ggml-large-v3-turbo-q5_0.bin", "Whisper large-v3-turbo-q5_0 (~547 МБ, GPU)"),
-    ModelPresetInfo("whisper:models/ggml-large-v3-turbo-q8_0.bin", "Whisper large-v3-turbo-q8_0 (~834 МБ, макс.)"),
+    ModelPresetInfo(
+        "sherpa:gigaam-v3-punct",
+        "GigaAM v3 RNN-T Punct (RU + пунктуация, CPU)",
+        "Лучший выбор для русского языка на CPU: быстрая, точная, сама расставляет знаки препинания. Видеокарту не использует."
+    ),
+    ModelPresetInfo(
+        "sherpa:gigaam-multilingual",
+        "GigaAM Multilingual CTC (RU + EN, CPU)",
+        "Для смешанной речи (русский + английские термины) на CPU без пунктуации. Хороша для программирования и заметок."
+    ),
+    ModelPresetInfo(
+        "whisper:models/ggml-tiny.bin",
+        "Whisper tiny (~75 МБ, сверхбыстрая)",
+        "Сверхлёгкая модель для слабых ПК и тестов без видеокарты: минимальная точность, но мгновенная работа на CPU."
+    ),
+    ModelPresetInfo(
+        "whisper:models/ggml-base.bin",
+        "Whisper base (~142 МБ, быстрая)",
+        "Базовая лёгкая модель для простых фраз на ноутбуках и CPU; сложные термины распознаёт хуже старших версий."
+    ),
+    ModelPresetInfo(
+        "whisper:models/ggml-small-q5_1.bin",
+        "Whisper small-q5_1 (~182 МБ, лёгкая для CPU)",
+        "Хороший вариант для слабого GPU или CPU: заметно точнее tiny/base при умеренном расходе памяти."
+    ),
+    ModelPresetInfo(
+        "whisper:models/ggml-medium-q5_0.bin",
+        "Whisper medium-q5_0 (~515 МБ, баланс)",
+        "Универсальный баланс для разных языков (RU/EN и др.): подходит для видеокарты от 2 ГБ VRAM или мощного CPU."
+    ),
+    ModelPresetInfo(
+        "whisper:models/ggml-large-v3-turbo-q5_0.bin",
+        "Whisper large-v3-turbo-q5_0 (~547 МБ, GPU)",
+        "Рекомендуется для видеокарты (Vulkan GPU): высокая скорость и отличное качество на русском, английском и смешанной речи."
+    ),
+    ModelPresetInfo(
+        "whisper:models/ggml-large-v3-turbo-q8_0.bin",
+        "Whisper large-v3-turbo-q8_0 (~834 МБ, макс.)",
+        "Максимальная точность Whisper: для сложной диктовки, акцентов и редких терминов при наличии видеокарты от 4 ГБ VRAM."
+    ),
 ];
+
+/// Возвращает рекомендацию и описание назначения модели по её идентификатору.
+string modelRecommendation(string optId) {
+    foreach (p; builtinModelPresets) {
+        if (p.id == optId) return p.hint;
+    }
+    return "Пользовательская локальная модель (выбрана через «Обзор...» или config.json).";
+}
 
 private enum string GigaV3Dir = "models/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16";
 private enum string GigaMultiDir = "models/gigaam-multilingual-ctc-int8";
@@ -243,6 +286,12 @@ string normalizeInputMode(string mode) {
     return "sendinput";
 }
 
+string normalizeTheme(string theme) {
+    auto t = theme.strip().toLower();
+    if (t == "light" || t == "dark" || t == "auto") return t;
+    return "auto";
+}
+
 private struct HotkeyEntry {
     string name;
     uint vk;
@@ -344,6 +393,8 @@ string serializeConfigJson(const ref AppConfig cfg) {
     root["inputMode"] = normalizeInputMode(cfg.inputMode);
     root["charDelayMs"] = cfg.charDelayMs;
     root["clipboardRestoreDelayMs"] = cfg.clipboardRestoreDelayMs;
+    root["overwriteNonTextClipboard"] = cfg.overwriteNonTextClipboard;
+    root["theme"] = normalizeTheme(cfg.theme);
     root["beep"] = cfg.beep;
     root["showOverlay"] = cfg.showOverlay;
     root["livePreview"] = cfg.livePreview;
@@ -417,6 +468,9 @@ AppConfig parseConfigJson(string content) {
     integer("charDelayMs", cfg.charDelayMs);
     if (cfg.charDelayMs < 0) cfg.charDelayMs = 0;
     integer("clipboardRestoreDelayMs", cfg.clipboardRestoreDelayMs);
+    boolean("overwriteNonTextClipboard", cfg.overwriteNonTextClipboard);
+    str("theme", cfg.theme);
+    cfg.theme = normalizeTheme(cfg.theme);
     boolean("beep", cfg.beep);
     boolean("showOverlay", cfg.showOverlay);
     boolean("livePreview", cfg.livePreview);
@@ -471,6 +525,14 @@ unittest {
     assert(cfg.initialPrompt == "Термины: D, Whisper");
     assert(cfg.inputMode == "auto");
     assert(cfg.charDelayMs == 5);
+    assert(!cfg.overwriteNonTextClipboard);
+
+    auto ov = parseConfigJson(`{"overwriteNonTextClipboard":true,"theme":"DARK"}`);
+    assert(ov.overwriteNonTextClipboard);
+    assert(ov.theme == "dark");
+    auto ovRt = parseConfigJson(serializeConfigJson(ov));
+    assert(ovRt.overwriteNonTextClipboard && ovRt.theme == "dark");
+    assert(normalizeTheme("unknown") == "auto");
 
     auto legacy = parseConfigJson(`{"pasteViaClipboard":true,"charDelayMs":-2}`);
     assert(legacy.inputMode == "clipboard");

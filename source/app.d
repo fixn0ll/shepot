@@ -4,8 +4,8 @@ import audio : AudioCapture, listInputDevices;
 import bootstrap : downloadModel, downloadSherpaModel, downloadSherpaRuntime,
     downloadVulkanRuntime, ensureAssets, hasAllStartupAssets, isSherpaModelReady;
 import config : AppConfig, applyModelPreset, builtinModelPresets, detectCustomModelFromFile,
-    loadConfig, modelOptionId, normalizeEngine, normalizeInputMode, parseHotkeyVk, resolvePath,
-    saveConfig, vkToKeyName;
+    loadConfig, modelOptionId, modelRecommendation, normalizeEngine, normalizeInputMode,
+    normalizeTheme, parseHotkeyVk, resolvePath, saveConfig, vkToKeyName;
 import core.atomic : atomicLoad, atomicStore;
 import core.time : MonoTime;
 import os_win : acquireSingleInstance, attachParentConsoleIfAny, closeTempConsole,
@@ -66,6 +66,7 @@ private struct SharedState {
     bool workerExited;
     int unloadTimeoutMin;
     int inputModeCode; // 0 = sendinput, 1 = clipboard, 2 = auto
+    bool overwriteNonTextClipboard;
     ulong lastActivityMs;
 }
 
@@ -100,14 +101,14 @@ private UiOption[] buildModelOptions(const ref AppConfig cfg) {
     UiOption[] opts;
     opts.reserve(builtinModelPresets.length + 1);
     foreach (p; builtinModelPresets) {
-        opts ~= UiOption(p.label, p.id);
+        opts ~= UiOption(p.label, p.id, p.hint);
     }
     auto curId = modelOptionId(cfg);
     if (!opts.any!(o => o.value == curId)) {
         auto label = normalizeEngine(cfg.engine) == "sherpa"
             ? ("Sherpa (пользовательская): " ~ baseName(cfg.sherpaEncoder.length ? cfg.sherpaEncoder : cfg.sherpaCtcModel))
             : (baseName(cfg.modelPath) ~ " (пользовательская)");
-        opts ~= UiOption(label, curId);
+        opts ~= UiOption(label, curId, modelRecommendation(curId));
     }
     return opts;
 }
@@ -432,7 +433,8 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
 
                             string method;
                             auto mode = decodeInputMode(atomicLoad(g_state.inputModeCode));
-                            typeText(text, mode, cfg.charDelayMs, cfg.clipboardRestoreDelayMs, method);
+                            bool overwriteClip = atomicLoad(g_state.overwriteNonTextClipboard);
+                            typeText(text, mode, cfg.charDelayMs, cfg.clipboardRestoreDelayMs, method, overwriteClip);
                             uiSetLastPhrase(text);
                             uiLog(format("[STT] (%.2fс, RMS=%.4f, %s): %s", dur, rms, method, text));
                             uiSetIdleStatus(true);
@@ -586,6 +588,7 @@ version (unittest) {
         atomicStore(g_state.workerExited, false);
         atomicStore(g_state.unloadTimeoutMin, cfg.unloadTimeoutMin);
         atomicStore(g_state.inputModeCode, encodeInputMode(normalizeInputMode(cfg.inputMode)));
+        atomicStore(g_state.overwriteNonTextClipboard, cfg.overwriteNonTextClipboard);
         atomicStore(g_state.lastActivityMs, nowMs());
 
         auto hotkeyVk = parseHotkeyVk(cfg.hotkey);
@@ -631,6 +634,8 @@ version (unittest) {
             langOpts,
             cfg.language,
             normalizeInputMode(cfg.inputMode),
+            normalizeTheme(cfg.theme),
+            cfg.overwriteNonTextClipboard,
             cfg.startMinimized,
             cfg.autoLoadModel,
             !cfg.useGpu,
@@ -752,6 +757,18 @@ version (unittest) {
                 atomicStore(g_state.inputModeCode, encodeInputMode(norm));
                 saveConfig(cfg);
                 uiLog("[CFG] Режим ввода: " ~ norm);
+            },
+            (string newTheme) {
+                auto norm = normalizeTheme(newTheme);
+                cfg.theme = norm;
+                saveConfig(cfg);
+                uiLog("[CFG] Тема оформления: " ~ norm);
+            },
+            (bool overwriteOn) {
+                cfg.overwriteNonTextClipboard = overwriteOn;
+                atomicStore(g_state.overwriteNonTextClipboard, overwriteOn);
+                saveConfig(cfg);
+                uiLog(format("[CFG] Заменять нетекстовый буфер: %s", overwriteOn ? "вкл" : "выкл"));
             },
             (bool toggleOn) {
                 cfg.toggleMode = toggleOn;
