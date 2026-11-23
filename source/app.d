@@ -7,8 +7,10 @@ import core.atomic : atomicLoad, atomicStore;
 import core.time : MonoTime;
 import os_win : acquireSingleInstance, attachParentConsoleIfAny, closeTempConsole,
     isWindowsAutostartEnabled, openTempConsole, releaseSingleInstance, runTrayApp,
-    setWindowsAutostart, showErrorBox, typeText, uiLog, uiSetIdleStatus, uiSetLoadWaiting,
-    uiSetModelState, uiSetProgress, uiSetStatus, uiSetVisual, UiOption, VisualState;
+    setWindowsAutostart, showErrorBox, typeText, uiLog, uiSetIdleStatus, uiSetLastPhrase,
+    uiSetLoadWaiting, uiSetModelState, uiSetProgress, uiSetStatus, uiSetVisual, UiOption,
+    VisualState;
+import postprocess : ReplacementStore;
 import sound : playActivationCueAsync, playClickAsync, playCueAsync;
 import std.algorithm.searching : any, canFind;
 import std.concurrency : OwnerTerminated, receive, send, spawn, Tid;
@@ -207,6 +209,7 @@ private void unloadModelNow(WhisperRecognizer* recognizer, string reason) {
 private void workerLoop(shared(AudioCapture)* audioPtr, shared(WhisperRecognizer)* sttPtr, immutable AppConfig cfg) {
     auto audio = cast(AudioCapture*) audioPtr;
     auto recognizer = cast(WhisperRecognizer*) sttPtr;
+    ReplacementStore replacements;
 
     if (cfg.autoLoadModel) {
         if (ensureModelLoaded(recognizer, false)) {
@@ -343,9 +346,17 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(WhisperRecognizer
                                 return;
                             }
 
+                            text = replacements.apply(text);
+                            if (text.length == 0) {
+                                uiSetIdleStatus(true);
+                                uiSetVisual(VisualState.idle, "Речь не распознана", 900);
+                                return;
+                            }
+
                             string method;
                             auto mode = decodeInputMode(atomicLoad(g_state.inputModeCode));
                             typeText(text, mode, cfg.charDelayMs, cfg.clipboardRestoreDelayMs, method);
+                            uiSetLastPhrase(text);
                             uiLog(format("[STT] (%.2fс, RMS=%.4f, %s): %s", dur, rms, method, text));
                             uiSetIdleStatus(true);
                             uiSetVisual(VisualState.pasted, "Вставлено: " ~ text, 1100);
@@ -473,6 +484,7 @@ version (unittest) {
             hotkeyVk,
             hotkeyName,
             cfg.blockHotkey,
+            cfg.toggleMode,
             mics,
             cfg.micDevice,
             modelOpts,
@@ -524,6 +536,15 @@ version (unittest) {
                 }
                 worker.send(WorkerCmd.transcribe);
             },
+            () {
+                atomicStore(g_state.recording, false);
+                atomicStore(g_state.lastActivityMs, nowMs());
+                capture.stopAndTakeBuffer();
+                if (atomicLoad(g_state.beepEnabled)) playCueAsync(false);
+                uiSetIdleStatus(atomicLoad(g_state.modelLoaded));
+                uiSetVisual(VisualState.idle, "Запись отменена", 1000);
+                uiLog("[REC] Запись отменена (Esc)");
+            },
             (int newDeviceId) {
                 string micErr;
                 if (capture.reopen(newDeviceId, micErr)) {
@@ -574,6 +595,11 @@ version (unittest) {
                 atomicStore(g_state.inputModeCode, encodeInputMode(norm));
                 saveConfig(cfg);
                 uiLog("[CFG] Режим ввода: " ~ norm);
+            },
+            (bool toggleOn) {
+                cfg.toggleMode = toggleOn;
+                saveConfig(cfg);
+                uiLog(format("[CFG] Режим переключения (Toggle): %s", toggleOn ? "вкл" : "выкл"));
             },
             (bool checked) {
                 cfg.autoLoadModel = checked;

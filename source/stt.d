@@ -78,6 +78,7 @@ struct WhisperRecognizer {
     private whisper_context* m_ctx;
     private string m_modelPath;
     private string m_language;
+    private string m_initialPrompt;
     private int m_threads;
     private bool m_useGpu;
 
@@ -87,9 +88,14 @@ struct WhisperRecognizer {
 
         m_modelPath = resolvePath(cfg.modelPath);
         m_language = cfg.language.length ? cfg.language : "auto";
+        m_initialPrompt = cfg.initialPrompt;
         m_threads = cfg.threads > 0 ? cfg.threads : 4;
         m_useGpu = cfg.useGpu;
         return true;
+    }
+
+    void setInitialPrompt(string prompt) {
+        m_initialPrompt = prompt;
     }
 
     void setModelPath(string modelRelOrAbs) {
@@ -174,6 +180,9 @@ struct WhisperRecognizer {
 
         params.n_threads = m_threads;
         params.language = m_language.toStringz();
+        if (m_initialPrompt.length > 0) {
+            params.initial_prompt = m_initialPrompt.toStringz();
+        }
         params.no_context = true;
         params.print_progress = false;
         params.print_realtime = false;

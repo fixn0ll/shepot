@@ -17,6 +17,8 @@ struct AppConfig {
     int unloadTimeoutMin = 5;
     string hotkey = "F9";
     bool blockHotkey = true;
+    bool toggleMode = false;
+    string initialPrompt = "";
     int micDevice = -1;
     double minDurationSec = 0.3;
     double rmsThreshold = 0.0015;
@@ -121,6 +123,8 @@ string serializeConfigJson(const ref AppConfig cfg) {
     root["unloadTimeoutMin"] = cfg.unloadTimeoutMin;
     root["hotkey"] = cfg.hotkey;
     root["blockHotkey"] = cfg.blockHotkey;
+    root["toggleMode"] = cfg.toggleMode;
+    root["initialPrompt"] = cfg.initialPrompt;
     root["micDevice"] = cfg.micDevice;
     root["minDurationSec"] = cfg.minDurationSec;
     root["rmsThreshold"] = cfg.rmsThreshold;
@@ -171,6 +175,8 @@ AppConfig parseConfigJson(string content) {
     integer("unloadTimeoutMin", cfg.unloadTimeoutMin);
     str("hotkey", cfg.hotkey);
     boolean("blockHotkey", cfg.blockHotkey);
+    boolean("toggleMode", cfg.toggleMode);
+    str("initialPrompt", cfg.initialPrompt);
     integer("micDevice", cfg.micDevice);
     floating("minDurationSec", cfg.minDurationSec);
     floating("rmsThreshold", cfg.rmsThreshold);
@@ -231,7 +237,7 @@ string vkToKeyName(uint vk) {
 }
 
 unittest {
-    auto cfg = parseConfigJson(`{"language":"en","threads":8,"useGpu":false,"autoLoadModel":false,"unloadTimeoutMin":15,"hotkey":"MOUSE4","blockHotkey":false,"inputMode":"auto","charDelayMs":5,"minDurationSec":0.5}`);
+    auto cfg = parseConfigJson(`{"language":"en","threads":8,"useGpu":false,"autoLoadModel":false,"unloadTimeoutMin":15,"hotkey":"MOUSE4","blockHotkey":false,"toggleMode":true,"initialPrompt":"Термины: D, Whisper","inputMode":"auto","charDelayMs":5,"minDurationSec":0.5}`);
     assert(cfg.language == "en");
     assert(cfg.threads == 8);
     assert(!cfg.useGpu);
@@ -239,6 +245,8 @@ unittest {
     assert(cfg.unloadTimeoutMin == 15);
     assert(cfg.hotkey == "MOUSE4");
     assert(!cfg.blockHotkey);
+    assert(cfg.toggleMode);
+    assert(cfg.initialPrompt == "Термины: D, Whisper");
     assert(cfg.inputMode == "auto");
     assert(cfg.charDelayMs == 5);
 
@@ -246,10 +254,12 @@ unittest {
     assert(legacy.inputMode == "clipboard");
     assert(legacy.charDelayMs == 0);
     assert(legacy.blockHotkey);
+    assert(!legacy.toggleMode);
 
     auto rt = parseConfigJson(serializeConfigJson(cfg));
     assert(!rt.autoLoadModel && rt.unloadTimeoutMin == 15 && rt.hotkey == "MOUSE4");
-    assert(!rt.blockHotkey && rt.inputMode == "auto" && rt.charDelayMs == 5);
+    assert(!rt.blockHotkey && rt.toggleMode && rt.initialPrompt == "Термины: D, Whisper");
+    assert(rt.inputMode == "auto" && rt.charDelayMs == 5);
 
     assert(parseHotkeyVk("F9") == 0x78);
     assert(parseHotkeyVk("mouse4") == 0x05);

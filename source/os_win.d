@@ -46,6 +46,7 @@ private enum int ID_CHK_LIVE_PREVIEW = 113;
 private enum int ID_CHK_OVERLAY = 114;
 private enum int ID_EDIT_LOG = 115;
 private enum int ID_COMBO_INPUT_MODE = 116;
+private enum int ID_CHK_TOGGLE_MODE = 117;
 
 private enum int ID_TRAY_TOGGLE = 201;
 private enum int ID_TRAY_EXIT = 202;
@@ -56,6 +57,8 @@ private enum int ID_TRAY_BEEP = 206;
 private enum int ID_TRAY_OVERLAY = 207;
 private enum int ID_TRAY_WIN_AUTO = 208;
 private enum int ID_TRAY_LIVE_PREVIEW = 209;
+private enum int ID_TRAY_COPY_LAST = 210;
+private enum int ID_TRAY_TOGGLE_MODE = 211;
 
 private enum int ID_TRAY_MIC_BASE = 1000;
 private enum int ID_TRAY_MODEL_BASE = 2000;
@@ -110,8 +113,12 @@ private struct AppUiState {
     uint hotkeyVk;
     string hotkeyName;
     bool blockHotkey = true;
+    bool toggleMode;
     bool isDown;
+    bool keyPhysicallyDown;
+    bool waitRelease;
     bool capturingHotkey;
+    string lastPhrase;
 
     bool modelLoaded;
     bool modelLoading;
@@ -130,6 +137,7 @@ private struct AppUiState {
 
     void delegate() onStart;
     void delegate() onStop;
+    void delegate() onCancel;
     void delegate(int) onMicChange;
     void delegate(string) onModelSelect;
     void delegate(string) onLangChange;
@@ -137,6 +145,7 @@ private struct AppUiState {
     void delegate() onModelToggle;
     void delegate(int) onTimeoutChange;
     void delegate(string) onInputModeChange;
+    void delegate(bool) onToggleModeChange;
     void delegate(bool) onAutoLoadChange;
     void delegate(bool) onCpuOnlyChange;
     void delegate(bool) onBeepChange;
@@ -170,6 +179,7 @@ private struct AppUiState {
     HWND chkWinAuto;
     HWND chkLivePreview;
     HWND chkOverlay;
+    HWND chkToggleMode;
     HWND lblLog;
     HWND editLog;
 
@@ -200,6 +210,8 @@ private struct AppUiState {
     int pendingLoadWait = -1;
     int pendingProgressMode = -1; // 0 reset, 1 marquee, 2 determinate
     int pendingProgressPct = 0;
+    string pendingLastPhrase;
+    bool hasPendingLastPhrase;
     string[] pendingLogs;
     bool clickTimerActive;
     bool marqueeActive;
@@ -394,6 +406,13 @@ private bool setClipboardUtf16(const(wchar)[] utf16) {
     return SetClipboardData(CF_UNICODETEXT, cast(HANDLE) hMem) !is null;
 }
 
+bool copyTextToClipboard(string text) {
+    if (text.length == 0 || !openClipboardRetry()) return false;
+    bool ok = setClipboardUtf16(toUTF16(text));
+    CloseClipboard();
+    return ok;
+}
+
 private void sendCtrlV() {
     WORD scCtrl = cast(WORD) MapVirtualKeyW(VK_CONTROL, 0);
     WORD scV = cast(WORD) MapVirtualKeyW('V', 0);
@@ -483,9 +502,18 @@ void uiSetIdleStatus(bool modelLoaded) {
     if (g_ui.mtx is null || g_ui.hwnd is null) return;
     g_ui.mtx.lock();
     g_ui.pendingStatus = modelLoaded
-        ? ("Готово — удерживайте [" ~ g_ui.hotkeyName ~ "]")
+        ? ((g_ui.toggleMode ? "Готово — нажмите [" : "Готово — удерживайте [") ~ g_ui.hotkeyName ~ "]")
         : ("Модель выгружена — нажмите [" ~ g_ui.hotkeyName ~ "] или Загрузить");
     g_ui.hasPendingStatus = true;
+    g_ui.mtx.unlock();
+    PostMessageW(g_ui.hwnd, WM_APP_SYNC, 0, 0);
+}
+
+void uiSetLastPhrase(string phrase) {
+    if (g_ui.mtx is null || g_ui.hwnd is null) return;
+    g_ui.mtx.lock();
+    g_ui.pendingLastPhrase = phrase;
+    g_ui.hasPendingLastPhrase = true;
     g_ui.mtx.unlock();
     PostMessageW(g_ui.hwnd, WM_APP_SYNC, 0, 0);
 }
@@ -543,6 +571,7 @@ bool runTrayApp(
     uint hotkeyVk,
     string hotkeyName,
     bool blockHotkey,
+    bool toggleMode,
     string[] micNames,
     int initialMic,
     UiOption[] modelOptions,
@@ -563,6 +592,7 @@ bool runTrayApp(
     string[] initialLogs,
     void delegate() onStart,
     void delegate() onStop,
+    void delegate() onCancel,
     void delegate(int) onMicChange,
     void delegate(string) onModelSelect,
     void delegate(string) onLangChange,
@@ -570,6 +600,7 @@ bool runTrayApp(
     void delegate() onModelToggle,
     void delegate(int) onTimeoutChange,
     void delegate(string) onInputModeChange,
+    void delegate(bool) onToggleModeChange,
     void delegate(bool) onAutoLoadChange,
     void delegate(bool) onCpuOnlyChange,
     void delegate(bool) onBeepChange,
@@ -589,7 +620,10 @@ bool runTrayApp(
     g_ui.hotkeyVk = hotkeyVk;
     g_ui.hotkeyName = hotkeyName;
     g_ui.blockHotkey = blockHotkey;
+    g_ui.toggleMode = toggleMode;
     g_ui.isDown = false;
+    g_ui.keyPhysicallyDown = false;
+    g_ui.waitRelease = false;
     g_ui.capturingHotkey = false;
     g_ui.modelLoaded = initialLoaded;
     g_ui.modelLoading = initialLoading;
@@ -609,6 +643,7 @@ bool runTrayApp(
 
     g_ui.onStart = onStart;
     g_ui.onStop = onStop;
+    g_ui.onCancel = onCancel;
     g_ui.onMicChange = onMicChange;
     g_ui.onModelSelect = onModelSelect;
     g_ui.onLangChange = onLangChange;
@@ -616,6 +651,7 @@ bool runTrayApp(
     g_ui.onModelToggle = onModelToggle;
     g_ui.onTimeoutChange = onTimeoutChange;
     g_ui.onInputModeChange = onInputModeChange;
+    g_ui.onToggleModeChange = onToggleModeChange;
     g_ui.onAutoLoadChange = onAutoLoadChange;
     g_ui.onCpuOnlyChange = onCpuOnlyChange;
     g_ui.onBeepChange = onBeepChange;
@@ -662,7 +698,7 @@ bool runTrayApp(
         clsName,
         "Shepot — Голосовой ввод"w.ptr,
         style,
-        CW_USEDEFAULT, CW_USEDEFAULT, 600, 630,
+        CW_USEDEFAULT, CW_USEDEFAULT, 600, 655,
         null, null, hInst, null
     );
     if (g_ui.hwnd is null) return false;
@@ -684,6 +720,7 @@ bool runTrayApp(
     SendMessageW(g_ui.chkWinAuto, BM_SETCHECK, winAutostart ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_ui.chkLivePreview, BM_SETCHECK, livePreview ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_ui.chkOverlay, BM_SETCHECK, showOverlay ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_ui.chkToggleMode, BM_SETCHECK, toggleMode ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(g_ui.btnHotkey, ("Назначить: [" ~ hotkeyName ~ "]").toUTF16z());
     applyModelButtonState(initialLoaded, initialLoading);
 
@@ -917,6 +954,9 @@ private void layoutChildren(int w, int h) {
     MoveWindow(g_ui.chkLivePreview, pad, y, halfW, 22, TRUE);
     MoveWindow(g_ui.chkOverlay, pad * 2 + halfW, y, halfW, 22, TRUE);
 
+    y += 24;
+    MoveWindow(g_ui.chkToggleMode, pad, y, halfW, 22, TRUE);
+
     y += 28;
     MoveWindow(g_ui.lblLog, pad, y, w - pad * 2, 18, TRUE);
 
@@ -961,6 +1001,8 @@ private void showTrayMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     auto toggleText = IsWindowVisible(hwnd) ? "Скрыть в трей"w.ptr : "Показать окно"w.ptr;
     AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, toggleText);
+    UINT copyFlags = MF_STRING | (g_ui.lastPhrase.length > 0 ? 0 : MF_GRAYED);
+    AppendMenuW(menu, copyFlags, ID_TRAY_COPY_LAST, "Скопировать последнюю фразу"w.ptr);
     AppendMenuW(menu, MF_SEPARATOR, 0, null);
 
     string modelBtnLabel = g_ui.modelLoading
@@ -1013,6 +1055,8 @@ private void showTrayMenu(HWND hwnd) {
 
     AppendMenuW(menu, MF_STRING, ID_TRAY_HOTKEY,
         ("Назначить клавишу [" ~ g_ui.hotkeyName ~ "]").toUTF16z());
+    AppendMenuW(menu, MF_STRING | (g_ui.toggleMode ? MF_CHECKED : MF_UNCHECKED),
+        ID_TRAY_TOGGLE_MODE, "Режим переключения (Toggle)"w.ptr);
 
     AppendMenuW(menu, MF_SEPARATOR, 0, null);
     AppendMenuW(menu, MF_STRING | (g_ui.cpuOnly ? MF_CHECKED : MF_UNCHECKED),
@@ -1114,6 +1158,8 @@ private void flushPendingUi(HWND hwnd) {
     int loadWait;
     int progMode;
     int progPct;
+    string lastPhrase;
+    bool hasLastPhrase;
     string[] logs;
 
     g_ui.mtx.lock();
@@ -1136,11 +1182,20 @@ private void flushPendingUi(HWND hwnd) {
     progMode = g_ui.pendingProgressMode;
     progPct = g_ui.pendingProgressPct;
     g_ui.pendingProgressMode = -1;
+    if (g_ui.hasPendingLastPhrase) {
+        lastPhrase = g_ui.pendingLastPhrase;
+        g_ui.hasPendingLastPhrase = false;
+        hasLastPhrase = true;
+    }
     if (g_ui.pendingLogs.length > 0) {
         logs = g_ui.pendingLogs;
         g_ui.pendingLogs = null;
     }
     g_ui.mtx.unlock();
+
+    if (hasLastPhrase) {
+        g_ui.lastPhrase = lastPhrase;
+    }
 
     if (modelState >= 0) {
         applyModelButtonState(modelState == 1, modelState == 2);
@@ -1271,6 +1326,13 @@ private void applyOverlay(bool checked) {
     if (g_ui.onOverlayChange !is null) g_ui.onOverlayChange(checked);
 }
 
+private void applyToggleMode(bool checked) {
+    g_ui.toggleMode = checked;
+    SendMessageW(g_ui.chkToggleMode, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_ui.onToggleModeChange !is null) g_ui.onToggleModeChange(checked);
+    if (!g_ui.isDown && !g_ui.modelLoading) uiSetIdleStatus(g_ui.modelLoaded);
+}
+
 private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow {
     try {
         switch (msg) {
@@ -1348,6 +1410,9 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 g_ui.chkOverlay = CreateWindowExW(0, "BUTTON"w.ptr, "Плавающий индикатор (HUD)"w.ptr,
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_CHK_OVERLAY, hInst, null);
+                g_ui.chkToggleMode = CreateWindowExW(0, "BUTTON"w.ptr, "Режим переключения (Toggle)"w.ptr,
+                    WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_CHK_TOGGLE_MODE, hInst, null);
 
                 g_ui.lblLog = CreateWindowExW(0, "STATIC"w.ptr, "Журнал работы:"w.ptr,
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
@@ -1362,7 +1427,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     g_ui.lblLang, g_ui.comboLang, g_ui.lblHotkey, g_ui.btnHotkey,
                     g_ui.lblTimeout, g_ui.comboTimeout, g_ui.lblInputMode, g_ui.comboInputMode,
                     g_ui.chkAutoLoad, g_ui.chkCpuOnly,
-                    g_ui.chkStartTray, g_ui.chkWinAuto, g_ui.chkLivePreview, g_ui.chkOverlay, g_ui.lblLog
+                    g_ui.chkStartTray, g_ui.chkWinAuto, g_ui.chkLivePreview, g_ui.chkOverlay,
+                    g_ui.chkToggleMode, g_ui.lblLog
                 ]) {
                     SendMessageW(ctrl, WM_SETFONT, cast(WPARAM) g_ui.fontUi, TRUE);
                 }
@@ -1391,7 +1457,7 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
             case WM_GETMINMAXINFO:
                 auto mmi = cast(MINMAXINFO*) lParam;
                 mmi.ptMinTrackSize.x = 520;
-                mmi.ptMinTrackSize.y = 545;
+                mmi.ptMinTrackSize.y = 570;
                 return 0;
 
             case WM_SIZE:
@@ -1442,6 +1508,13 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyOverlay(!g_ui.showOverlay);
                 } else if (id == ID_TRAY_LIVE_PREVIEW) {
                     applyLivePreview(!g_ui.livePreview);
+                } else if (id == ID_TRAY_TOGGLE_MODE) {
+                    applyToggleMode(!g_ui.toggleMode);
+                } else if (id == ID_TRAY_COPY_LAST) {
+                    if (copyTextToClipboard(g_ui.lastPhrase)) {
+                        uiLog("[CLIP] Скопирована последняя фраза: " ~ g_ui.lastPhrase);
+                        uiSetVisual(VisualState.pasted, "Скопировано в буфер", 900);
+                    }
                 } else if (id == ID_TRAY_WIN_AUTO) {
                     applyWinAuto(!g_ui.winAutostart);
                 } else if (id >= ID_TRAY_MIC_BASE && id < ID_TRAY_MODEL_BASE) {
@@ -1480,6 +1553,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyLivePreview(SendMessageW(g_ui.chkLivePreview, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 } else if (id == ID_CHK_OVERLAY) {
                     applyOverlay(SendMessageW(g_ui.chkOverlay, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                } else if (id == ID_CHK_TOGGLE_MODE) {
+                    applyToggleMode(SendMessageW(g_ui.chkToggleMode, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 }
                 return 0;
 
@@ -1543,7 +1618,35 @@ private bool handleTriggerEvent(uint vk, bool isDownMsg, bool isUpMsg, bool isMo
             return true;
         }
 
+        if (g_ui.isDown && !isMouse && vk == VK_ESCAPE && isDownMsg) {
+            g_ui.isDown = false;
+            if (!g_ui.toggleMode) g_ui.waitRelease = true;
+            if (g_ui.onCancel !is null) g_ui.onCancel();
+            return true;
+        }
+
         if (vk == g_ui.hotkeyVk) {
+            if (g_ui.toggleMode) {
+                if (isDownMsg && !g_ui.keyPhysicallyDown) {
+                    g_ui.keyPhysicallyDown = true;
+                    if (!g_ui.isDown) {
+                        g_ui.isDown = true;
+                        if (g_ui.onStart !is null) g_ui.onStart();
+                    } else {
+                        g_ui.isDown = false;
+                        if (g_ui.onStop !is null) g_ui.onStop();
+                    }
+                } else if (isUpMsg) {
+                    g_ui.keyPhysicallyDown = false;
+                }
+                return isMouse || g_ui.blockHotkey;
+            }
+
+            if (g_ui.waitRelease) {
+                if (isUpMsg) g_ui.waitRelease = false;
+                return isMouse || g_ui.blockHotkey;
+            }
+
             if (isDownMsg && !g_ui.isDown) {
                 g_ui.isDown = true;
                 if (g_ui.onStart !is null) g_ui.onStart();
