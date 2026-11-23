@@ -3,6 +3,7 @@ module stt_sherpa;
 import config : AppConfig, resolvePath;
 import sherpa_c;
 import std.file : exists;
+import std.path : buildPath, dirName;
 import std.string : fromStringz, strip, toLower, toStringz;
 import stt_engine : isHallucination, SAMPLE_RATE, SttEngine;
 
@@ -19,11 +20,14 @@ class SherpaRecognizer : SttEngine {
     private string m_language;
     private int m_threads = 4;
     private bool m_useGpu;
+    private string m_dllDir;
     private string m_activeProvider = "cpu";
 
     override bool initApi(const ref AppConfig cfg, out string err) {
         auto dllPath = resolvePath(cfg.sherpaDll);
         if (!m_api.load(dllPath, err)) return false;
+
+        m_dllDir = dirName(dllPath);
 
         m_modelType = cfg.sherpaModelType.strip().toLower();
         m_encoder = resolvePath(cfg.sherpaEncoder);
@@ -63,6 +67,10 @@ class SherpaRecognizer : SttEngine {
         return m_useGpu && m_activeProvider != "cpu";
     }
 
+    override bool supportsGpu() const {
+        return m_dllDir.length > 0 && exists(buildPath(m_dllDir, "onnxruntime_providers_cuda.dll"));
+    }
+
     override bool isLoaded() const {
         return m_recognizer !is null;
     }
@@ -79,18 +87,16 @@ class SherpaRecognizer : SttEngine {
             return false;
         }
 
-        bool ctc = isCtcMode();
-        if (ctc) {
+        if (isCtcMode()) {
             if (m_ctcModel.length == 0 || !exists(m_ctcModel)) {
-                err = "Не найден CTC ONNX-файл модели: " ~ m_ctcModel;
+                err = "Не найден ONNX-файл модели: " ~ m_ctcModel;
                 return false;
             }
         } else {
-            foreach (pair; [
-                [m_encoder, "encoder"],
-                [m_decoder, "decoder"],
-                [m_joiner, "joiner"],
-            ]) {
+            string[2][] required = isEncDecMode()
+                ? [[m_encoder, "encoder"], [m_decoder, "decoder"]]
+                : [[m_encoder, "encoder"], [m_decoder, "decoder"], [m_joiner, "joiner"]];
+            foreach (pair; required) {
                 if (pair[0].length == 0 || !exists(pair[0])) {
                     err = "Не найден файл sherpa " ~ pair[1] ~ ": " ~ pair[0];
                     return false;
@@ -98,7 +104,7 @@ class SherpaRecognizer : SttEngine {
             }
         }
 
-        if (m_useGpu) {
+        if (m_useGpu && supportsGpu()) {
             m_recognizer = tryCreateRecognizer("cuda");
             if (m_recognizer !is null) {
                 m_activeProvider = "cuda";
@@ -135,17 +141,53 @@ class SherpaRecognizer : SttEngine {
         const(char)* joinZ = null;
         const(char)* ctcZ = null;
         const(char)* mtypeZ = null;
+        const(char)* langZ = null;
+        const(char)* taskZ = null;
 
         if (isCtcMode()) {
             ctcZ = m_ctcModel.toStringz();
             if (m_modelType == "paraformer") {
                 rcfg.model_config.paraformer.model = ctcZ;
+            } else if (m_modelType == "sense_voice") {
+                langZ = (m_language == "auto" ? "auto" : m_language).toStringz();
+                rcfg.model_config.sense_voice.model = ctcZ;
+                rcfg.model_config.sense_voice.language = langZ;
+                rcfg.model_config.sense_voice.use_itn = 1;
+            } else if (m_modelType == "dolphin") {
+                rcfg.model_config.dolphin.model = ctcZ;
+            } else if (m_modelType == "zipformer_ctc") {
+                rcfg.model_config.zipformer_ctc.model = ctcZ;
+            } else if (m_modelType == "wenet_ctc") {
+                rcfg.model_config.wenet_ctc.model = ctcZ;
+            } else if (m_modelType == "telespeech_ctc") {
+                rcfg.model_config.telespeech_ctc = ctcZ;
             } else {
                 rcfg.model_config.nemo_ctc.model = ctcZ;
                 if (m_modelType == "nemo_ctc") {
                     mtypeZ = "nemo_ctc".toStringz();
                     rcfg.model_config.model_type = mtypeZ;
                 }
+            }
+        } else if (isEncDecMode()) {
+            encZ = m_encoder.toStringz();
+            decZ = m_decoder.toStringz();
+            if (m_modelType == "fire_red_asr") {
+                rcfg.model_config.fire_red_asr.encoder = encZ;
+                rcfg.model_config.fire_red_asr.decoder = decZ;
+            } else if (m_modelType == "canary") {
+                langZ = (m_language == "auto" ? "ru" : m_language).toStringz();
+                rcfg.model_config.canary.encoder = encZ;
+                rcfg.model_config.canary.decoder = decZ;
+                rcfg.model_config.canary.src_lang = langZ;
+                rcfg.model_config.canary.tgt_lang = langZ;
+                rcfg.model_config.canary.use_pnc = 1;
+            } else {
+                langZ = (m_language == "auto" ? "" : m_language).toStringz();
+                taskZ = "transcribe".toStringz();
+                rcfg.model_config.whisper.encoder = encZ;
+                rcfg.model_config.whisper.decoder = decZ;
+                rcfg.model_config.whisper.language = langZ;
+                rcfg.model_config.whisper.task = taskZ;
             }
         } else {
             encZ = m_encoder.toStringz();
@@ -166,10 +208,18 @@ class SherpaRecognizer : SttEngine {
     }
 
     private bool isCtcMode() const {
-        if (m_modelType == "nemo_ctc" || m_modelType == "gigaam_ctc" || m_modelType == "paraformer") {
+        if (m_modelType == "nemo_ctc" || m_modelType == "gigaam_ctc" || m_modelType == "paraformer"
+            || m_modelType == "sense_voice" || m_modelType == "dolphin"
+            || m_modelType == "zipformer_ctc" || m_modelType == "wenet_ctc"
+            || m_modelType == "telespeech_ctc")
+        {
             return true;
         }
         return m_modelType.length == 0 && m_ctcModel.length > 0 && m_encoder.length == 0;
+    }
+
+    private bool isEncDecMode() const {
+        return m_modelType == "whisper" || m_modelType == "fire_red_asr" || m_modelType == "canary";
     }
 
     private string resolvedTransducerModelType() const {
@@ -259,5 +309,9 @@ unittest {
 
     s.m_modelType = "nemo_ctc";
     assert(s.isCtcMode());
+    s.m_modelType = "sense_voice";
+    assert(s.isCtcMode());
+    s.m_modelType = "whisper";
+    assert(s.isEncDecMode() && !s.isCtcMode());
     assert(!s.supportsRemoteDownload());
 }

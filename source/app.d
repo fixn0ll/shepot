@@ -3,15 +3,16 @@ module app;
 import audio : AudioCapture, listInputDevices;
 import bootstrap : downloadModel, downloadSherpaModel, downloadSherpaRuntime,
     downloadVulkanRuntime, ensureAssets, hasAllStartupAssets, isSherpaModelReady;
-import config : AppConfig, applyModelPreset, builtinModelPresets, loadConfig, modelOptionId,
-    normalizeEngine, normalizeInputMode, parseHotkeyVk, resolvePath, saveConfig, vkToKeyName;
+import config : AppConfig, applyModelPreset, builtinModelPresets, detectCustomModelFromFile,
+    loadConfig, modelOptionId, normalizeEngine, normalizeInputMode, parseHotkeyVk, resolvePath,
+    saveConfig, vkToKeyName;
 import core.atomic : atomicLoad, atomicStore;
 import core.time : MonoTime;
 import os_win : acquireSingleInstance, attachParentConsoleIfAny, closeTempConsole,
     isWindowsAutostartEnabled, openTempConsole, releaseSingleInstance, runTrayApp,
-    setWindowsAutostart, showErrorBox, typeText, uiLog, uiSetIdleStatus, uiSetLastPhrase,
-    uiSetLoadWaiting, uiSetModelState, uiSetProgress, uiSetStatus, uiSetVisual, UiOption,
-    VisualState;
+    setWindowsAutostart, showErrorBox, typeText, uiLog, uiSetGpuAvailable, uiSetIdleStatus,
+    uiSetLastPhrase, uiSetLoadWaiting, uiSetModelOptions, uiSetModelState, uiSetProgress,
+    uiSetStatus, uiSetVisual, UiOption, VisualState;
 import postprocess : ReplacementStore;
 import sound : playActivationCueAsync, playClickAsync, playCueAsync;
 import std.algorithm.searching : any, canFind;
@@ -295,6 +296,7 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
                         return;
                     }
                     recognizer = nextRec;
+                    uiSetGpuAvailable(recognizer.supportsGpu());
 
                     if (needReload) {
                         if (ensureModelLoaded(recognizer, curCfg, true)) {
@@ -610,7 +612,7 @@ version (unittest) {
         auto activeModelName = recognizer.modelPath().length ? baseName(recognizer.modelPath()) : cfg.sherpaModelType;
         string[] initLogs = [
             format("%s готов (%s, режим: %s)",
-                recognizer.engineVersion(), activeModelName, cfg.useGpu ? "GPU" : "CPU"),
+                recognizer.engineVersion(), activeModelName, recognizer.useGpu() ? "GPU" : "CPU"),
             format("Активация: [%s], язык: %s, автовыгрузка: %s",
                 hotkeyName, cfg.language, cfg.unloadTimeoutMin > 0 ? format("%s мин", cfg.unloadTimeoutMin) : "Никогда"),
             format("Найдено микрофонов: %s", mics.length),
@@ -632,6 +634,7 @@ version (unittest) {
             cfg.startMinimized,
             cfg.autoLoadModel,
             !cfg.useGpu,
+            recognizer.supportsGpu(),
             winAuto,
             cfg.showOverlay,
             cfg.beep,
@@ -695,6 +698,22 @@ version (unittest) {
             (string newOptId) {
                 applyModelPreset(cfg, newOptId);
                 saveConfig(cfg);
+                immutable AppConfig nextCfg = cfg;
+                worker.send(SwitchModelMsg(nextCfg, atomicLoad(g_state.autoLoadModel)));
+            },
+            (string pickedPath) {
+                AppConfig nextCfgMut = cfg;
+                string detErr;
+                if (!detectCustomModelFromFile(pickedPath, nextCfgMut, detErr)) {
+                    uiLog("[ОШИБКА] " ~ detErr);
+                    showErrorBox(detErr);
+                    return;
+                }
+                cfg = nextCfgMut;
+                saveConfig(cfg);
+                uiSetModelOptions(buildModelOptions(cfg), modelOptionId(cfg));
+                uiLog(format("[CFG] Пользовательская модель (%s/%s): %s",
+                    cfg.engine, cfg.engine == "sherpa" ? cfg.sherpaModelType : "ggml", baseName(pickedPath)));
                 immutable AppConfig nextCfg = cfg;
                 worker.send(SwitchModelMsg(nextCfg, atomicLoad(g_state.autoLoadModel)));
             },

@@ -69,6 +69,10 @@ class WhisperRecognizer : SttEngine {
         return m_useGpu;
     }
 
+    override bool supportsGpu() const {
+        return true;
+    }
+
     override bool isLoaded() const {
         return m_ctx !is null;
     }

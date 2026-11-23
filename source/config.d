@@ -1,11 +1,13 @@
 module config;
 
+import std.algorithm.searching : canFind, endsWith;
 import std.conv : to;
-import std.file : exists, readText, thisExePath, write;
+import std.file : dirEntries, exists, isDir, readText, SpanMode, thisExePath, write;
 import std.format : format;
 import std.json : JSONType, JSONValue, parseJSON;
-import std.path : buildPath, dirName, isAbsolute;
-import std.string : strip, toUpper;
+import std.path : baseName, buildNormalizedPath, buildPath, dirName, isAbsolute;
+import std.array : replace;
+import std.string : strip, toLower, toUpper;
 
 struct AppConfig {
     string engine = "whisper";
@@ -110,6 +112,128 @@ void applyModelPreset(ref AppConfig cfg, string optId) {
     }
     cfg.engine = "whisper";
     cfg.modelPath = optId;
+}
+
+/// Преобразует путь в относительный относительно exeDir(), если файл находится внутри папки приложения.
+string toConfigPath(string p) {
+    auto base = buildNormalizedPath(exeDir());
+    auto norm = buildNormalizedPath(p);
+    version (Windows) {
+        auto baseL = base.toLower();
+        auto normL = norm.toLower();
+        if (normL.length > baseL.length && normL[0 .. baseL.length] == baseL
+            && (normL[baseL.length] == '\\' || normL[baseL.length] == '/'))
+        {
+            return norm[baseL.length + 1 .. $].replace("\\", "/");
+        }
+    }
+    return norm;
+}
+
+private string pickSherpaPart(string[] onnxFiles, string token, string pickedPath, bool preferInt8) {
+    if (pickedPath.length > 0 && baseName(pickedPath).toLower().canFind(token)) {
+        return pickedPath;
+    }
+    string fallback;
+    foreach (f; onnxFiles) {
+        auto bn = baseName(f).toLower();
+        if (!bn.canFind(token)) continue;
+        bool isInt8 = bn.canFind(".int8.");
+        if (isInt8 == preferInt8) return f;
+        if (fallback.length == 0) fallback = f;
+    }
+    return fallback;
+}
+
+/// Автоматически определяет движок и пути к файлам модели по выбранному .bin / .onnx / tokens.txt.
+bool detectCustomModelFromFile(string selectedPath, ref AppConfig cfg, out string err) {
+    if (selectedPath.length == 0 || !exists(selectedPath)) {
+        err = "Файл не найден: " ~ selectedPath;
+        return false;
+    }
+
+    auto bn = baseName(selectedPath).toLower();
+    if (bn.endsWith(".bin")) {
+        cfg.engine = "whisper";
+        cfg.modelPath = toConfigPath(selectedPath);
+        return true;
+    }
+
+    if (!bn.endsWith(".onnx") && !bn.endsWith("tokens.txt")) {
+        err = "Выберите файл .bin (Whisper) или .onnx / tokens.txt (sherpa-onnx).";
+        return false;
+    }
+
+    auto dir = isDir(selectedPath) ? selectedPath : dirName(selectedPath);
+    string[] onnxFiles;
+    string tokensFile;
+    foreach (entry; dirEntries(dir, SpanMode.shallow)) {
+        if (!entry.isFile) continue;
+        auto name = entry.name;
+        auto nameL = baseName(name).toLower();
+        if (nameL.endsWith(".onnx")) {
+            onnxFiles ~= name;
+        } else if (nameL == "tokens.txt" || (tokensFile.length == 0 && nameL.endsWith("-tokens.txt"))) {
+            tokensFile = name;
+        }
+    }
+
+    if (tokensFile.length == 0) {
+        err = "В папке модели не найден файл tokens.txt: " ~ dir;
+        return false;
+    }
+    if (onnxFiles.length == 0) {
+        err = "В папке не найдены файлы *.onnx: " ~ dir;
+        return false;
+    }
+
+    bool preferInt8 = bn.canFind(".int8.");
+    string pickedOnnx = bn.endsWith(".onnx") ? selectedPath : "";
+    auto enc = pickSherpaPart(onnxFiles, "encoder", pickedOnnx, preferInt8);
+    auto dec = pickSherpaPart(onnxFiles, "decoder", pickedOnnx, preferInt8);
+    auto join = pickSherpaPart(onnxFiles, "joiner", pickedOnnx, preferInt8);
+
+    auto hint = (dir ~ "/" ~ bn).toLower();
+    cfg.engine = "sherpa";
+    if (cfg.sherpaDll.length == 0) cfg.sherpaDll = "sherpa-onnx-c-api.dll";
+    cfg.sherpaTokens = toConfigPath(tokensFile);
+
+    if (enc.length > 0 && dec.length > 0 && join.length > 0) {
+        cfg.sherpaModelType = (hint.canFind("giga") || hint.canFind("nemo") || hint.canFind("parakeet"))
+            ? "nemo_transducer"
+            : "transducer";
+        cfg.sherpaEncoder = toConfigPath(enc);
+        cfg.sherpaDecoder = toConfigPath(dec);
+        cfg.sherpaJoiner = toConfigPath(join);
+        cfg.sherpaCtcModel = "";
+        return true;
+    }
+
+    if (enc.length > 0 && dec.length > 0) {
+        if (hint.canFind("firered")) cfg.sherpaModelType = "fire_red_asr";
+        else if (hint.canFind("canary")) cfg.sherpaModelType = "canary";
+        else cfg.sherpaModelType = "whisper";
+        cfg.sherpaEncoder = toConfigPath(enc);
+        cfg.sherpaDecoder = toConfigPath(dec);
+        cfg.sherpaJoiner = "";
+        cfg.sherpaCtcModel = "";
+        return true;
+    }
+
+    string single = pickedOnnx.length > 0 ? pickedOnnx : onnxFiles[0];
+    if (hint.canFind("sense-voice") || hint.canFind("sensevoice")) cfg.sherpaModelType = "sense_voice";
+    else if (hint.canFind("paraformer")) cfg.sherpaModelType = "paraformer";
+    else if (hint.canFind("dolphin")) cfg.sherpaModelType = "dolphin";
+    else if (hint.canFind("zipformer")) cfg.sherpaModelType = "zipformer_ctc";
+    else if (hint.canFind("wenet")) cfg.sherpaModelType = "wenet_ctc";
+    else if (hint.canFind("telespeech")) cfg.sherpaModelType = "telespeech_ctc";
+    else cfg.sherpaModelType = "nemo_ctc";
+
+    cfg.sherpaEncoder = "";
+    cfg.sherpaDecoder = "";
+    cfg.sherpaJoiner = "";
+    cfg.sherpaCtcModel = toConfigPath(single);
+    return true;
 }
 
 string normalizeInputMode(string mode) {
@@ -390,4 +514,46 @@ unittest {
     applyModelPreset(sw, "whisper:models/ggml-base.bin");
     assert(sw.engine == "whisper" && sw.modelPath == "models/ggml-base.bin");
     assert(modelOptionId(sw) == "whisper:models/ggml-base.bin");
+
+    // Автоопределение пользовательских моделей
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir;
+    auto tmpRoot = buildPath(tempDir(), "shepot_cfg_test");
+    if (exists(tmpRoot)) rmdirRecurse(tmpRoot);
+    scope (exit) if (exists(tmpRoot)) rmdirRecurse(tmpRoot);
+
+    auto gigaDir = buildPath(tmpRoot, "custom-giga-v3");
+    auto senseDir = buildPath(tmpRoot, "sense-voice-int8");
+    auto whOnnxDir = buildPath(tmpRoot, "whisper-tiny-onnx");
+    mkdirRecurse(gigaDir);
+    mkdirRecurse(senseDir);
+    mkdirRecurse(whOnnxDir);
+
+    auto ggmlFile = buildPath(tmpRoot, "my-custom.bin");
+    write(ggmlFile, "stub");
+    write(buildPath(gigaDir, "encoder.int8.onnx"), "stub");
+    write(buildPath(gigaDir, "decoder.onnx"), "stub");
+    write(buildPath(gigaDir, "joiner.onnx"), "stub");
+    write(buildPath(gigaDir, "tokens.txt"), "stub");
+    write(buildPath(senseDir, "model.int8.onnx"), "stub");
+    write(buildPath(senseDir, "tokens.txt"), "stub");
+    write(buildPath(whOnnxDir, "tiny-encoder.int8.onnx"), "stub");
+    write(buildPath(whOnnxDir, "tiny-decoder.int8.onnx"), "stub");
+    write(buildPath(whOnnxDir, "tiny-tokens.txt"), "stub");
+
+    AppConfig det;
+    string derr;
+    assert(detectCustomModelFromFile(ggmlFile, det, derr));
+    assert(det.engine == "whisper" && det.modelPath.endsWith("my-custom.bin"));
+
+    assert(detectCustomModelFromFile(buildPath(gigaDir, "tokens.txt"), det, derr));
+    assert(det.engine == "sherpa" && det.sherpaModelType == "nemo_transducer");
+    assert(det.sherpaEncoder.endsWith("encoder.int8.onnx"));
+
+    assert(detectCustomModelFromFile(buildPath(senseDir, "model.int8.onnx"), det, derr));
+    assert(det.engine == "sherpa" && det.sherpaModelType == "sense_voice");
+    assert(det.sherpaCtcModel.endsWith("model.int8.onnx"));
+
+    assert(detectCustomModelFromFile(buildPath(whOnnxDir, "tiny-encoder.int8.onnx"), det, derr));
+    assert(det.engine == "sherpa" && det.sherpaModelType == "whisper");
+    assert(det.sherpaJoiner.length == 0 && det.sherpaTokens.endsWith("tiny-tokens.txt"));
 }

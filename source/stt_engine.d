@@ -30,6 +30,7 @@ interface SttEngine {
     void setLanguage(string lang);
     void setUseGpu(bool useGpu);
     bool useGpu() const;
+    bool supportsGpu() const;
     bool supportsRemoteDownload() const;
 }
 

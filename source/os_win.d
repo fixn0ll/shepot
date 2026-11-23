@@ -3,6 +3,8 @@ module os_win;
 import core.stdc.stdio : freopen, stderr, stdout;
 import core.stdc.string : memcpy;
 import core.sync.mutex : Mutex;
+import core.sys.windows.commdlg : GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW;
 import core.sys.windows.commctrl;
 import core.sys.windows.shellapi;
 import core.sys.windows.winbase : CloseHandle, CreateMutexW, GetFileType, GetLastError,
@@ -26,7 +28,7 @@ import std.file : thisExePath;
 import std.format : format;
 import std.math : fabs, sqrt;
 import std.range : walkLength;
-import std.utf : toUTF16, toUTF16z;
+import std.utf : toUTF16, toUTF16z, toUTF8;
 
 private enum uint WM_APP_TRAY = WM_APP + 1;
 private enum uint WM_APP_SYNC = WM_APP + 2;
@@ -48,6 +50,7 @@ private enum int ID_CHK_OVERLAY = 114;
 private enum int ID_EDIT_LOG = 115;
 private enum int ID_COMBO_INPUT_MODE = 116;
 private enum int ID_CHK_TOGGLE_MODE = 117;
+private enum int ID_BTN_BROWSE_MODEL = 118;
 
 private enum int ID_TRAY_TOGGLE = 201;
 private enum int ID_TRAY_EXIT = 202;
@@ -60,6 +63,7 @@ private enum int ID_TRAY_WIN_AUTO = 208;
 private enum int ID_TRAY_LIVE_PREVIEW = 209;
 private enum int ID_TRAY_COPY_LAST = 210;
 private enum int ID_TRAY_TOGGLE_MODE = 211;
+private enum int ID_TRAY_BROWSE_MODEL = 212;
 
 private enum int ID_TRAY_MIC_BASE = 1000;
 private enum int ID_TRAY_MODEL_BASE = 2000;
@@ -132,6 +136,7 @@ private struct AppUiState {
     int currentTimeoutMin;
     string currentInputMode = "sendinput";
     bool cpuOnly;
+    bool gpuAvailable = true;
     bool beepEnabled;
     bool livePreview;
     bool winAutostart;
@@ -141,6 +146,7 @@ private struct AppUiState {
     void delegate() onCancel;
     void delegate(int) onMicChange;
     void delegate(string) onModelSelect;
+    void delegate(string) onCustomModelPick;
     void delegate(string) onLangChange;
     string delegate(uint) onHotkeyChange;
     void delegate() onModelToggle;
@@ -166,6 +172,7 @@ private struct AppUiState {
     HWND comboMic;
     HWND lblModel;
     HWND comboModel;
+    HWND btnBrowseModel;
     HWND lblLang;
     HWND comboLang;
     HWND lblHotkey;
@@ -208,6 +215,7 @@ private struct AppUiState {
     bool hasPendingHudText;
     int pendingHudHideMs = -1;
     int pendingModelState = -1;
+    int pendingGpuAvailable = -1;
     int pendingLoadWait = -1;
     int pendingProgressMode = -1; // 0 reset, 1 marquee, 2 determinate
     int pendingProgressPct = 0;
@@ -528,6 +536,14 @@ void uiSetModelState(bool loaded, bool loading) {
     PostMessageW(g_ui.hwnd, WM_APP_SYNC, 0, 0);
 }
 
+void uiSetGpuAvailable(bool available) {
+    if (g_ui.mtx is null || g_ui.hwnd is null) return;
+    g_ui.mtx.lock();
+    g_ui.pendingGpuAvailable = available ? 1 : 0;
+    g_ui.mtx.unlock();
+    PostMessageW(g_ui.hwnd, WM_APP_SYNC, 0, 0);
+}
+
 void uiSetLoadWaiting(bool waiting) {
     if (g_ui.mtx is null || g_ui.hwnd is null) return;
     g_ui.mtx.lock();
@@ -584,6 +600,7 @@ bool runTrayApp(
     bool startMinimized,
     bool autoLoad,
     bool cpuOnly,
+    bool gpuAvailable,
     bool winAutostart,
     bool showOverlay,
     bool beepEnabled,
@@ -597,6 +614,7 @@ bool runTrayApp(
     void delegate() onCancel,
     void delegate(int) onMicChange,
     void delegate(string) onModelSelect,
+    void delegate(string) onCustomModelPick,
     void delegate(string) onLangChange,
     string delegate(uint) onHotkeyChange,
     void delegate() onModelToggle,
@@ -638,6 +656,7 @@ bool runTrayApp(
     g_ui.currentTimeoutMin = initialTimeoutMin;
     g_ui.currentInputMode = initialInputMode.length ? initialInputMode : "sendinput";
     g_ui.cpuOnly = cpuOnly;
+    g_ui.gpuAvailable = gpuAvailable;
     g_ui.beepEnabled = beepEnabled;
     g_ui.livePreview = livePreview;
     g_ui.winAutostart = winAutostart;
@@ -648,6 +667,7 @@ bool runTrayApp(
     g_ui.onCancel = onCancel;
     g_ui.onMicChange = onMicChange;
     g_ui.onModelSelect = onModelSelect;
+    g_ui.onCustomModelPick = onCustomModelPick;
     g_ui.onLangChange = onLangChange;
     g_ui.onHotkeyChange = onHotkeyChange;
     g_ui.onModelToggle = onModelToggle;
@@ -717,7 +737,7 @@ bool runTrayApp(
     populateOptionCombo(g_ui.comboInputMode, cast(UiOption[]) inputModeOptions, g_ui.currentInputMode);
 
     SendMessageW(g_ui.chkAutoLoad, BM_SETCHECK, autoLoad ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(g_ui.chkCpuOnly, BM_SETCHECK, cpuOnly ? BST_CHECKED : BST_UNCHECKED, 0);
+    syncCpuOnlyControl();
     SendMessageW(g_ui.chkStartTray, BM_SETCHECK, startMinimized ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_ui.chkWinAuto, BM_SETCHECK, winAutostart ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_ui.chkLivePreview, BM_SETCHECK, livePreview ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -848,7 +868,36 @@ private void populateMicCombo(string[] micNames, int initialMic) {
     SendMessageW(g_ui.comboMic, CB_SETCURSEL, sel, 0);
 }
 
+void uiSetModelOptions(UiOption[] options, string currentVal) {
+    g_ui.modelOptions = options;
+    g_ui.currentModel = currentVal;
+    if (g_ui.comboModel !is null) {
+        populateOptionCombo(g_ui.comboModel, options, currentVal);
+    }
+}
+
+private void openCustomModelDialog(HWND hwnd) {
+    if (g_ui.onCustomModelPick is null) return;
+    wchar[1024] buf = 0;
+    OPENFILENAMEW ofn;
+    ofn.lStructSize = OPENFILENAMEW.sizeof;
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = "Модели (*.bin;*.onnx;tokens.txt)\0*.bin;*.onnx;tokens.txt\0Whisper GGML (*.bin)\0*.bin\0Sherpa ONNX (*.onnx)\0*.onnx\0Все файлы (*.*)\0*.*\0\0"w.ptr;
+    ofn.lpstrFile = buf.ptr;
+    ofn.nMaxFile = cast(DWORD) buf.length;
+    ofn.lpstrTitle = "Выберите файл модели (.bin или .onnx / tokens.txt)"w.ptr;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    size_t len = 0;
+    while (len < buf.length && buf[len] != 0) ++len;
+    if (len > 0) {
+        g_ui.onCustomModelPick(buf[0 .. len].toUTF8());
+    }
+}
+
 private void populateOptionCombo(HWND combo, UiOption[] options, string currentVal) {
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
     int sel = 0;
     foreach (i, opt; options) {
         SendMessageW(combo, CB_ADDSTRING, 0, cast(LPARAM) opt.label.toUTF16z());
@@ -924,8 +973,10 @@ private void layoutChildren(int w, int h) {
     MoveWindow(g_ui.comboMic, pad + labelW + 8, y, ctrlW, 220, TRUE);
 
     y += 32;
+    int browseW = 74;
     MoveWindow(g_ui.lblModel, pad, y + 4, labelW, 20, TRUE);
-    MoveWindow(g_ui.comboModel, pad + labelW + 8, y, ctrlW, 220, TRUE);
+    MoveWindow(g_ui.comboModel, pad + labelW + 8, y, ctrlW - browseW - 6, 220, TRUE);
+    MoveWindow(g_ui.btnBrowseModel, pad + labelW + 8 + ctrlW - browseW, y - 1, browseW, 25, TRUE);
 
     y += 32;
     MoveWindow(g_ui.lblLang, pad, y + 4, labelW, 20, TRUE);
@@ -1019,6 +1070,8 @@ private void showTrayMenu(HWND hwnd) {
         UINT fl = MF_STRING | (opt.value == g_ui.currentModel ? MF_CHECKED : MF_UNCHECKED);
         AppendMenuW(subModel, fl, ID_TRAY_MODEL_BASE + i, opt.label.toUTF16z());
     }
+    AppendMenuW(subModel, MF_SEPARATOR, 0, null);
+    AppendMenuW(subModel, MF_STRING, ID_TRAY_BROWSE_MODEL, "Выбрать свою модель..."w.ptr);
     AppendMenuW(menu, MF_POPUP, cast(size_t) subModel, "Модель"w.ptr);
 
     // Подменю языков
@@ -1061,8 +1114,9 @@ private void showTrayMenu(HWND hwnd) {
         ID_TRAY_TOGGLE_MODE, "Режим переключения (Toggle)"w.ptr);
 
     AppendMenuW(menu, MF_SEPARATOR, 0, null);
-    AppendMenuW(menu, MF_STRING | (g_ui.cpuOnly ? MF_CHECKED : MF_UNCHECKED),
-        ID_TRAY_CPU_ONLY, "Только на процессоре (CPU)"w.ptr);
+    bool cpuDisplay = !g_ui.gpuAvailable || g_ui.cpuOnly;
+    UINT cpuFlags = MF_STRING | (cpuDisplay ? MF_CHECKED : MF_UNCHECKED) | (g_ui.gpuAvailable ? 0 : MF_GRAYED);
+    AppendMenuW(menu, cpuFlags, ID_TRAY_CPU_ONLY, "Только на процессоре (CPU)"w.ptr);
     AppendMenuW(menu, MF_STRING | (g_ui.beepEnabled ? MF_CHECKED : MF_UNCHECKED),
         ID_TRAY_BEEP, "Звуковые сигналы"w.ptr);
     AppendMenuW(menu, MF_STRING | (g_ui.showOverlay ? MF_CHECKED : MF_UNCHECKED),
@@ -1157,6 +1211,7 @@ private void flushPendingUi(HWND hwnd) {
     bool hasHudText;
     int hudHideMs;
     int modelState;
+    int gpuAvail;
     int loadWait;
     int progMode;
     int progPct;
@@ -1179,6 +1234,8 @@ private void flushPendingUi(HWND hwnd) {
     g_ui.pendingHudHideMs = -1;
     modelState = g_ui.pendingModelState;
     g_ui.pendingModelState = -1;
+    gpuAvail = g_ui.pendingGpuAvailable;
+    g_ui.pendingGpuAvailable = -1;
     loadWait = g_ui.pendingLoadWait;
     g_ui.pendingLoadWait = -1;
     progMode = g_ui.pendingProgressMode;
@@ -1201,6 +1258,10 @@ private void flushPendingUi(HWND hwnd) {
 
     if (modelState >= 0) {
         applyModelButtonState(modelState == 1, modelState == 2);
+    }
+    if (gpuAvail >= 0) {
+        g_ui.gpuAvailable = (gpuAvail == 1);
+        syncCpuOnlyControl();
     }
     if (progMode >= 0) {
         applyProgressState(progMode, progPct);
@@ -1303,9 +1364,17 @@ private void applyInputModeSelection(int idx) {
     if (g_ui.onInputModeChange !is null) g_ui.onInputModeChange(g_ui.currentInputMode);
 }
 
+private void syncCpuOnlyControl() {
+    if (g_ui.chkCpuOnly is null) return;
+    bool displayChecked = !g_ui.gpuAvailable || g_ui.cpuOnly;
+    SendMessageW(g_ui.chkCpuOnly, BM_SETCHECK, displayChecked ? BST_CHECKED : BST_UNCHECKED, 0);
+    EnableWindow(g_ui.chkCpuOnly, g_ui.gpuAvailable ? TRUE : FALSE);
+}
+
 private void applyCpuOnly(bool checked) {
+    if (!g_ui.gpuAvailable) return;
     g_ui.cpuOnly = checked;
-    SendMessageW(g_ui.chkCpuOnly, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    syncCpuOnlyControl();
     if (g_ui.onCpuOnlyChange !is null) g_ui.onCpuOnlyChange(checked);
 }
 
@@ -1369,6 +1438,9 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 g_ui.comboModel = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_MODEL, hInst, null);
+                g_ui.btnBrowseModel = CreateWindowExW(0, "BUTTON"w.ptr, "Обзор..."w.ptr,
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_BTN_BROWSE_MODEL, hInst, null);
 
                 g_ui.lblLang = CreateWindowExW(0, "STATIC"w.ptr, "Язык речи:"w.ptr,
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
@@ -1426,7 +1498,7 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 SendMessageW(g_ui.btnModel, WM_SETFONT, cast(WPARAM) g_ui.fontBtnBold, TRUE);
                 foreach (ctrl; [
                     g_ui.btnHide, g_ui.lblMic, g_ui.comboMic, g_ui.lblModel, g_ui.comboModel,
-                    g_ui.lblLang, g_ui.comboLang, g_ui.lblHotkey, g_ui.btnHotkey,
+                    g_ui.btnBrowseModel, g_ui.lblLang, g_ui.comboLang, g_ui.lblHotkey, g_ui.btnHotkey,
                     g_ui.lblTimeout, g_ui.comboTimeout, g_ui.lblInputMode, g_ui.comboInputMode,
                     g_ui.chkAutoLoad, g_ui.chkCpuOnly,
                     g_ui.chkStartTray, g_ui.chkWinAuto, g_ui.chkLivePreview, g_ui.chkOverlay,
@@ -1495,6 +1567,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     toggleWindowVisibility(hwnd);
                 } else if (id == ID_BTN_MODEL || id == ID_TRAY_MODEL_TOGGLE) {
                     if (g_ui.onModelToggle !is null) g_ui.onModelToggle();
+                } else if (id == ID_BTN_BROWSE_MODEL || id == ID_TRAY_BROWSE_MODEL) {
+                    openCustomModelDialog(hwnd);
                 } else if (id == ID_BTN_HOTKEY || id == ID_TRAY_HOTKEY) {
                     g_ui.capturingHotkey = true;
                     SetWindowTextW(g_ui.btnHotkey, "Нажмите клавишу или кнопку мыши (Esc — отмена)..."w.ptr);
