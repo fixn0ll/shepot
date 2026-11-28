@@ -17,8 +17,8 @@ private enum string HfModelBaseUrl =
 
 private enum string SherpaRuntimeUrl =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-v2.0.3-win-x64-shared-MD-Release-no-tts-lib.tar.bz2";
-private enum string GigaAmV3PunctUrl =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16.tar.bz2";
+private enum string GigaAmV4BaseUrl =
+    "https://huggingface.co/Altushkins/GigaAM-v4-onnx/resolve/main/gigaam-v4-rnnt/";
 private enum string GigaAmMultiModelUrl =
     "https://huggingface.co/i2z1/gigaam-multilingual-ctc-onnx-int8/resolve/main/model.int8.onnx";
 private enum string GigaAmMultiTokensUrl =
@@ -152,22 +152,30 @@ bool downloadSherpaRuntime(string targetDir, void delegate(int pct) onProgress =
 
 bool downloadSherpaModel(const ref AppConfig cfg, void delegate(int pct) onProgress = null) {
     auto id = modelOptionId(cfg);
-    if (id == "sherpa:gigaam-v3-punct") {
+    if (id == "sherpa:gigaam-v4-rnnt") {
         auto encAbs = resolvePath(cfg.sherpaEncoder);
-        auto modelsRoot = dirName(dirName(encAbs));
-        mkdirRecurse(modelsRoot);
-        auto archive = buildPath(modelsRoot, "_gigaam_v3_punct.tar.bz2");
-        scope (exit) {
-            if (exists(archive)) remove(archive);
-        }
+        mkdirRecurse(dirName(encAbs));
+        void delegate(int) quietCb = onProgress !is null ? (int _) {} : null;
 
-        if (onProgress is null) writeln(tr("Downloading GigaAM v3 RNN-T Punct (~162 MB)...", "Скачивание GigaAM v3 RNN-T Punct (~162 МБ)..."));
-        if (!downloadFile(GigaAmV3PunctUrl, archive, onProgress)) {
-            if (onProgress is null) writeln(tr("Error: failed to download GigaAM v3.", "Ошибка: не удалось скачать GigaAM v3."));
-            return false;
+        string[2][3] extraFiles = [
+            [cfg.sherpaTokens, "tokens.txt"],
+            [cfg.sherpaDecoder, "decoder.onnx"],
+            [cfg.sherpaJoiner, "joiner.onnx"],
+        ];
+        foreach (pair; extraFiles) {
+            auto dst = resolvePath(pair[0]);
+            if (!exists(dst) && !downloadFile(GigaAmV4BaseUrl ~ pair[1], dst, quietCb)) {
+                return false;
+            }
         }
-        if (onProgress is null) writeln(tr("Extracting GigaAM v3...", "Распаковка GigaAM v3..."));
-        return runTool(["tar.exe", "-xjf", archive, "-C", modelsRoot], onProgress !is null);
+        if (!exists(encAbs)) {
+            if (onProgress is null) writeln(tr("Downloading GigaAM v4 RNN-T int8 (~236 MB)...", "Скачивание GigaAM v4 RNN-T int8 (~236 МБ)..."));
+            if (!downloadFile(GigaAmV4BaseUrl ~ "encoder.int8.onnx", encAbs, onProgress)) {
+                if (onProgress is null) writeln(tr("Error: failed to download GigaAM v4.", "Ошибка: не удалось скачать GigaAM v4."));
+                return false;
+            }
+        }
+        return true;
     }
 
     if (id == "sherpa:gigaam-multilingual") {

@@ -62,11 +62,11 @@ struct ModelPresetInfo {
 
 static immutable ModelPresetInfo[] builtinModelPresets = [
     ModelPresetInfo(
-        "sherpa:gigaam-v3-punct",
-        "GigaAM v3 RNN-T Punct (RU + punctuation, CPU)",
-        "GigaAM v3 RNN-T Punct (RU + пунктуация, CPU)",
-        "Best choice for Russian on CPU: fast, accurate, adds punctuation automatically. Does not use GPU.",
-        "Лучший выбор для русского языка на CPU: быстрая, точная, сама расставляет знаки препинания. Видеокарту не использует."
+        "sherpa:gigaam-v4-rnnt",
+        "GigaAM v4 RNN-T (RU + EN + punctuation, CPU)",
+        "GigaAM v4 RNN-T (RU + EN + пунктуация, CPU)",
+        "Best choice for Russian and mixed speech on CPU: fast, accurate, adds punctuation automatically. Does not use GPU.",
+        "Лучший выбор для русского и смешанной речи на CPU: быстрая, точная, с автопунктуацией. Видеокарту не использует."
     ),
     ModelPresetInfo(
         "sherpa:gigaam-multilingual",
@@ -130,13 +130,13 @@ string modelRecommendation(string optId) {
     );
 }
 
-private enum string GigaV3Dir = "models/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16";
+private enum string GigaV4Dir = "models/gigaam-v4-rnnt";
 private enum string GigaMultiDir = "models/gigaam-multilingual-ctc-int8";
 
 /// Возвращает идентификатор выбранного пресета модели для UI.
 string modelOptionId(const ref AppConfig cfg) {
     if (normalizeEngine(cfg.engine) == "sherpa") {
-        if (cfg.sherpaEncoder == GigaV3Dir ~ "/encoder.int8.onnx") return "sherpa:gigaam-v3-punct";
+        if (cfg.sherpaEncoder == GigaV4Dir ~ "/encoder.int8.onnx") return "sherpa:gigaam-v4-rnnt";
         if (cfg.sherpaCtcModel == GigaMultiDir ~ "/model.int8.onnx") return "sherpa:gigaam-multilingual";
         return "sherpa:custom";
     }
@@ -145,15 +145,15 @@ string modelOptionId(const ref AppConfig cfg) {
 
 /// Применяет пресет модели из UI к AppConfig (обновляет engine и пути к файлам).
 void applyModelPreset(ref AppConfig cfg, string optId) {
-    if (optId == "sherpa:gigaam-v3-punct") {
+    if (optId == "sherpa:gigaam-v4-rnnt") {
         cfg.engine = "sherpa";
         if (cfg.sherpaDll.length == 0) cfg.sherpaDll = "sherpa-onnx-c-api.dll";
         cfg.sherpaModelType = "nemo_transducer";
-        cfg.sherpaEncoder = GigaV3Dir ~ "/encoder.int8.onnx";
-        cfg.sherpaDecoder = GigaV3Dir ~ "/decoder.onnx";
-        cfg.sherpaJoiner = GigaV3Dir ~ "/joiner.onnx";
+        cfg.sherpaEncoder = GigaV4Dir ~ "/encoder.int8.onnx";
+        cfg.sherpaDecoder = GigaV4Dir ~ "/decoder.onnx";
+        cfg.sherpaJoiner = GigaV4Dir ~ "/joiner.onnx";
         cfg.sherpaCtcModel = "";
-        cfg.sherpaTokens = GigaV3Dir ~ "/tokens.txt";
+        cfg.sherpaTokens = GigaV4Dir ~ "/tokens.txt";
         return;
     }
     if (optId == "sherpa:gigaam-multilingual") {
@@ -596,9 +596,9 @@ unittest {
     assert(modelOptionId(shRt) == "sherpa:custom");
 
     AppConfig sw;
-    applyModelPreset(sw, "sherpa:gigaam-v3-punct");
+    applyModelPreset(sw, "sherpa:gigaam-v4-rnnt");
     assert(sw.engine == "sherpa" && sw.sherpaModelType == "nemo_transducer");
-    assert(modelOptionId(sw) == "sherpa:gigaam-v3-punct");
+    assert(modelOptionId(sw) == "sherpa:gigaam-v4-rnnt");
 
     applyModelPreset(sw, "sherpa:gigaam-multilingual");
     assert(sw.engine == "sherpa" && sw.sherpaModelType == "nemo_ctc");

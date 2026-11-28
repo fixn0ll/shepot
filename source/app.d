@@ -67,6 +67,7 @@ private struct SharedState {
     bool workerExited;
     int unloadTimeoutMin;
     int inputModeCode; // 0 = sendinput, 1 = clipboard, 2 = auto
+    int charDelayMs;
     bool overwriteNonTextClipboard;
     ulong lastActivityMs;
 }
@@ -448,8 +449,9 @@ private void workerLoop(shared(AudioCapture)* audioPtr, shared(SttEngine)* sttPt
 
                             string method;
                             auto mode = decodeInputMode(atomicLoad(g_state.inputModeCode));
+                            int delayMs = atomicLoad(g_state.charDelayMs);
                             bool overwriteClip = atomicLoad(g_state.overwriteNonTextClipboard);
-                            typeText(text, mode, cfg.charDelayMs, cfg.clipboardRestoreDelayMs, method, overwriteClip);
+                            typeText(text, mode, delayMs, cfg.clipboardRestoreDelayMs, method, overwriteClip);
                             uiSetLastPhrase(text);
                             uiLog(format(tr("[STT] (%.2fs, RMS=%.4f, %s): %s", "[STT] (%.2fс, RMS=%.4f, %s): %s"), dur, rms, method, text));
                             uiSetIdleStatus(true);
@@ -620,6 +622,7 @@ version (unittest) {
         atomicStore(g_state.workerExited, false);
         atomicStore(g_state.unloadTimeoutMin, cfg.unloadTimeoutMin);
         atomicStore(g_state.inputModeCode, encodeInputMode(normalizeInputMode(cfg.inputMode)));
+        atomicStore(g_state.charDelayMs, cfg.charDelayMs < 0 ? 0 : cfg.charDelayMs);
         atomicStore(g_state.overwriteNonTextClipboard, cfg.overwriteNonTextClipboard);
         atomicStore(g_state.lastActivityMs, nowMs());
 
@@ -674,6 +677,7 @@ version (unittest) {
             langOpts,
             cfg.language,
             normalizeInputMode(cfg.inputMode),
+            cfg.charDelayMs,
             normalizeTheme(cfg.theme),
             cfg.overwriteNonTextClipboard,
             cfg.startMinimized,
@@ -806,6 +810,13 @@ version (unittest) {
                 atomicStore(g_state.inputModeCode, encodeInputMode(norm));
                 saveConfig(cfg);
                 uiLog(tr("[CFG] Input mode: ", "[CFG] Режим ввода: ") ~ norm);
+            },
+            (int delayMs) {
+                int clamped = delayMs < 0 ? 0 : delayMs;
+                cfg.charDelayMs = clamped;
+                atomicStore(g_state.charDelayMs, clamped);
+                saveConfig(cfg);
+                uiLog(format(tr("[CFG] Char input delay: %s ms", "[CFG] Задержка посимвольного ввода: %s мс"), clamped));
             },
             (string newTheme) {
                 auto norm = normalizeTheme(newTheme);

@@ -67,6 +67,7 @@ private enum int ID_COMBO_THEME = 124;
 private enum int ID_BTN_OPEN_REPL = 125;
 private enum int ID_BTN_OPEN_MODELS = 126;
 private enum int ID_COMBO_UI_LANG = 127;
+private enum int ID_COMBO_CHAR_DELAY = 128;
 
 private enum int ID_TRAY_TOGGLE = 201;
 private enum int ID_TRAY_EXIT = 202;
@@ -89,6 +90,7 @@ private enum int ID_TRAY_TIMEOUT_BASE = 4000;
 private enum int ID_TRAY_INPUT_MODE_BASE = 5000;
 private enum int ID_TRAY_THEME_BASE = 6000;
 private enum int ID_TRAY_UI_LANG_BASE = 6100;
+private enum int ID_TRAY_CHAR_DELAY_BASE = 6200;
 
 private enum size_t ID_TIMER_IDLE = 1;
 private enum size_t ID_TIMER_CLICK = 2;
@@ -150,6 +152,23 @@ static immutable UiOption[] uiLangOptions = [
     UiOption("Русский", "ru"),
 ];
 
+struct CharDelayOption {
+    string labelEn;
+    string labelRu;
+    int ms;
+}
+
+static immutable CharDelayOption[] charDelayOptions = [
+    CharDelayOption("0 ms (fastest)", "0 мс (макс. скорость)", 0),
+    CharDelayOption("1 ms", "1 мс", 1),
+    CharDelayOption("3 ms (default)", "3 мс (по умолчанию)", 3),
+    CharDelayOption("5 ms", "5 мс", 5),
+    CharDelayOption("10 ms (games)", "10 мс (игры)", 10),
+    CharDelayOption("20 ms (slow games)", "20 мс (медленные игры)", 20),
+    CharDelayOption("35 ms", "35 мс", 35),
+    CharDelayOption("50 ms (very slow)", "50 мс (очень медленно)", 50),
+];
+
 private struct AppUiState {
     HHOOK kbdHook;
     HHOOK mouseHook;
@@ -173,6 +192,8 @@ private struct AppUiState {
     string currentLang;
     int currentTimeoutMin;
     string currentInputMode = "sendinput";
+    int currentCharDelayMs = 3;
+    int[] charDelayValues;
     string currentTheme = "auto";
     bool darkActive;
     int activePage = 0; // 0 = Главная, 1 = Настройки
@@ -194,6 +215,7 @@ private struct AppUiState {
     void delegate() onModelToggle;
     void delegate(int) onTimeoutChange;
     void delegate(string) onInputModeChange;
+    void delegate(int) onCharDelayChange;
     void delegate(string) onThemeChange;
     void delegate(string) onUiLangChange;
     void delegate(bool) onOverwriteClipChange;
@@ -232,6 +254,8 @@ private struct AppUiState {
     HWND comboTimeout;
     HWND lblInputMode;
     HWND comboInputMode;
+    HWND lblCharDelay;
+    HWND comboCharDelay;
     HWND lblTheme;
     HWND comboTheme;
     HWND lblUiLang;
@@ -660,6 +684,7 @@ bool runTrayApp(
     UiOption[] langOptions,
     string initialLang,
     string initialInputMode,
+    int initialCharDelayMs,
     string initialTheme,
     bool overwriteNonTextClip,
     bool startMinimized,
@@ -685,6 +710,7 @@ bool runTrayApp(
     void delegate() onModelToggle,
     void delegate(int) onTimeoutChange,
     void delegate(string) onInputModeChange,
+    void delegate(int) onCharDelayChange,
     void delegate(string) onThemeChange,
     void delegate(string) onUiLangChange,
     void delegate(bool) onOverwriteClipChange,
@@ -723,6 +749,7 @@ bool runTrayApp(
     g_ui.currentLang = initialLang;
     g_ui.currentTimeoutMin = initialTimeoutMin;
     g_ui.currentInputMode = initialInputMode.length ? initialInputMode : "sendinput";
+    g_ui.currentCharDelayMs = initialCharDelayMs < 0 ? 0 : initialCharDelayMs;
     g_ui.currentTheme = initialTheme.length ? initialTheme : "auto";
     g_ui.activePage = 0;
     g_ui.overwriteNonTextClip = overwriteNonTextClip;
@@ -744,6 +771,7 @@ bool runTrayApp(
     g_ui.onModelToggle = onModelToggle;
     g_ui.onTimeoutChange = onTimeoutChange;
     g_ui.onInputModeChange = onInputModeChange;
+    g_ui.onCharDelayChange = onCharDelayChange;
     g_ui.onThemeChange = onThemeChange;
     g_ui.onUiLangChange = onUiLangChange;
     g_ui.onOverwriteClipChange = onOverwriteClipChange;
@@ -810,6 +838,7 @@ bool runTrayApp(
     populateOptionCombo(g_ui.comboLang, langOptions, initialLang);
     populateTimeoutCombo(initialTimeoutMin);
     populateLocalizedCombo(g_ui.comboInputMode, inputModeOptions, g_ui.currentInputMode);
+    populateCharDelayCombo(g_ui.currentCharDelayMs);
     populateLocalizedCombo(g_ui.comboTheme, themeOptions, g_ui.currentTheme);
     populateOptionCombo(g_ui.comboUiLang, cast(UiOption[]) uiLangOptions, getUiLanguage());
 
@@ -1024,6 +1053,25 @@ private void populateTimeoutCombo(int minutes) {
     SendMessageW(g_ui.comboTimeout, CB_SETCURSEL, sel, 0);
 }
 
+private void populateCharDelayCombo(int delayMs) {
+    int normalized = delayMs < 0 ? 0 : delayMs;
+    SendMessageW(g_ui.comboCharDelay, CB_RESETCONTENT, 0, 0);
+    g_ui.charDelayValues = null;
+    int sel = -1;
+    foreach (i, opt; charDelayOptions) {
+        SendMessageW(g_ui.comboCharDelay, CB_ADDSTRING, 0, cast(LPARAM) tr(opt.labelEn, opt.labelRu).toUTF16z());
+        g_ui.charDelayValues ~= opt.ms;
+        if (opt.ms == normalized) sel = cast(int) i;
+    }
+    if (sel < 0) {
+        auto customLabel = format(tr("%s ms (custom)", "%s мс (своя)"), normalized);
+        SendMessageW(g_ui.comboCharDelay, CB_ADDSTRING, 0, cast(LPARAM) customLabel.toUTF16z());
+        g_ui.charDelayValues ~= normalized;
+        sel = cast(int) g_ui.charDelayValues.length - 1;
+    }
+    SendMessageW(g_ui.comboCharDelay, CB_SETCURSEL, sel, 0);
+}
+
 private void applyModelButtonState(bool loaded, bool loading) {
     g_ui.modelLoaded = loaded;
     g_ui.modelLoading = loading;
@@ -1106,54 +1154,60 @@ private void layoutChildren(int w, int h) {
     // Страница 1: Настройки
     int labelW = 166;
     int ctrlW = w - pad * 2 - labelW - 8;
-    int sy = y + 40;
+    int sy = y + 36;
     MoveWindow(g_ui.lblMic, pad, sy + 4, labelW, 20, TRUE);
     MoveWindow(g_ui.comboMic, pad + labelW + 8, sy, ctrlW, 220, TRUE);
 
-    sy += 34;
+    sy += 31;
     MoveWindow(g_ui.lblLang, pad, sy + 4, labelW, 20, TRUE);
     MoveWindow(g_ui.comboLang, pad + labelW + 8, sy, ctrlW, 220, TRUE);
 
-    sy += 34;
+    sy += 31;
     MoveWindow(g_ui.lblHotkey, pad, sy + 5, labelW, 20, TRUE);
-    MoveWindow(g_ui.btnHotkey, pad + labelW + 8, sy, ctrlW, 28, TRUE);
+    MoveWindow(g_ui.btnHotkey, pad + labelW + 8, sy, ctrlW, 26, TRUE);
 
-    sy += 36;
+    sy += 33;
     MoveWindow(g_ui.lblTimeout, pad, sy + 4, labelW, 20, TRUE);
     MoveWindow(g_ui.comboTimeout, pad + labelW + 8, sy, ctrlW, 220, TRUE);
 
-    sy += 34;
+    sy += 31;
     MoveWindow(g_ui.lblInputMode, pad, sy + 4, labelW, 20, TRUE);
     MoveWindow(g_ui.comboInputMode, pad + labelW + 8, sy, ctrlW, 220, TRUE);
 
-    sy += 34;
+    sy += 31;
+    MoveWindow(g_ui.lblCharDelay, pad, sy + 4, labelW, 20, TRUE);
+    MoveWindow(g_ui.comboCharDelay, pad + labelW + 8, sy, ctrlW, 220, TRUE);
+
+    sy += 31;
     MoveWindow(g_ui.lblTheme, pad, sy + 4, labelW, 20, TRUE);
     MoveWindow(g_ui.comboTheme, pad + labelW + 8, sy, ctrlW, 220, TRUE);
 
     sy += 34;
-    MoveWindow(g_ui.lblUiLang, pad, sy + 4, labelW, 20, TRUE);
-    MoveWindow(g_ui.comboUiLang, pad + labelW + 8, sy, ctrlW, 220, TRUE);
-
-    sy += 38;
     int halfW = (w - pad * 3) / 2;
     MoveWindow(g_ui.chkAutoLoad, pad, sy, halfW, 22, TRUE);
     MoveWindow(g_ui.chkCpuOnly, pad * 2 + halfW, sy, halfW, 22, TRUE);
 
-    sy += 26;
+    sy += 24;
     MoveWindow(g_ui.chkStartTray, pad, sy, halfW, 22, TRUE);
     MoveWindow(g_ui.chkWinAuto, pad * 2 + halfW, sy, halfW, 22, TRUE);
 
-    sy += 26;
+    sy += 24;
     MoveWindow(g_ui.chkLivePreview, pad, sy, halfW, 22, TRUE);
     MoveWindow(g_ui.chkOverlay, pad * 2 + halfW, sy, halfW, 22, TRUE);
 
-    sy += 26;
+    sy += 24;
     MoveWindow(g_ui.chkToggleMode, pad, sy, halfW, 22, TRUE);
     MoveWindow(g_ui.chkOverwriteClip, pad * 2 + halfW, sy, halfW, 22, TRUE);
 
-    sy += 34;
+    sy += 30;
     MoveWindow(g_ui.btnOpenReplacements, pad, sy, halfW, 28, TRUE);
     MoveWindow(g_ui.btnOpenModelsDir, pad * 2 + halfW, sy, halfW, 28, TRUE);
+
+    int langComboW = 104;
+    int langLabelW = 128;
+    int langY = max(sy + 38, h - pad - 24);
+    MoveWindow(g_ui.lblUiLang, w - pad - langComboW - 8 - langLabelW, langY + 4, langLabelW, 20, TRUE);
+    MoveWindow(g_ui.comboUiLang, w - pad - langComboW, langY, langComboW, 120, TRUE);
 }
 
 private HICON idleTrayIcon() {
@@ -1243,6 +1297,13 @@ private void showTrayMenu(HWND hwnd) {
         AppendMenuW(subInputMode, fl, ID_TRAY_INPUT_MODE_BASE + i, tr(opt.labelEn, opt.labelRu).toUTF16z());
     }
     AppendMenuW(menu, MF_POPUP, cast(size_t) subInputMode, tr("Input Mode", "Режим ввода").toUTF16z());
+
+    HMENU subCharDelay = CreatePopupMenu();
+    foreach (i, opt; charDelayOptions) {
+        UINT fl = MF_STRING | (opt.ms == g_ui.currentCharDelayMs ? MF_CHECKED : MF_UNCHECKED);
+        AppendMenuW(subCharDelay, fl, ID_TRAY_CHAR_DELAY_BASE + i, tr(opt.labelEn, opt.labelRu).toUTF16z());
+    }
+    AppendMenuW(menu, MF_POPUP, cast(size_t) subCharDelay, tr("Char Delay", "Задержка ввода").toUTF16z());
 
     HMENU subTheme = CreatePopupMenu();
     foreach (i, opt; themeOptions) {
@@ -1525,6 +1586,13 @@ private void applyInputModeSelection(int idx) {
     if (g_ui.onInputModeChange !is null) g_ui.onInputModeChange(g_ui.currentInputMode);
 }
 
+private void applyCharDelaySelection(int idx) {
+    if (idx < 0 || idx >= cast(int) g_ui.charDelayValues.length) return;
+    g_ui.currentCharDelayMs = g_ui.charDelayValues[idx];
+    SendMessageW(g_ui.comboCharDelay, CB_SETCURSEL, idx, 0);
+    if (g_ui.onCharDelayChange !is null) g_ui.onCharDelayChange(g_ui.currentCharDelayMs);
+}
+
 private void syncCpuOnlyControl() {
     if (g_ui.chkCpuOnly is null) return;
     bool displayChecked = !g_ui.gpuAvailable || g_ui.cpuOnly;
@@ -1641,14 +1709,15 @@ private void applyWindowTheme(HWND hwnd) {
             }
             foreach (c; [
                 g_ui.comboMic, g_ui.comboModel, g_ui.comboLang,
-                g_ui.comboTimeout, g_ui.comboInputMode, g_ui.comboTheme, g_ui.comboUiLang,
+                g_ui.comboTimeout, g_ui.comboInputMode, g_ui.comboCharDelay,
+                g_ui.comboTheme, g_ui.comboUiLang,
             ]) {
                 if (c !is null) pTheme(c, cfdName, null);
             }
             foreach (c; [
                 g_ui.lblStatus, g_ui.lblModel, g_ui.lblModelHint, g_ui.lblLog, g_ui.lblMic,
-                g_ui.lblLang, g_ui.lblHotkey, g_ui.lblTimeout, g_ui.lblInputMode, g_ui.lblTheme,
-                g_ui.lblUiLang,
+                g_ui.lblLang, g_ui.lblHotkey, g_ui.lblTimeout, g_ui.lblInputMode, g_ui.lblCharDelay,
+                g_ui.lblTheme, g_ui.lblUiLang,
             ]) {
                 if (c !is null) pTheme(c, dark ? ""w.ptr : null, dark ? ""w.ptr : null);
             }
@@ -1682,7 +1751,8 @@ private void setActivePage(int page) {
     foreach (c; [
         g_ui.lblMic, g_ui.comboMic, g_ui.lblLang, g_ui.comboLang,
         g_ui.lblHotkey, g_ui.btnHotkey, g_ui.lblTimeout, g_ui.comboTimeout,
-        g_ui.lblInputMode, g_ui.comboInputMode, g_ui.lblTheme, g_ui.comboTheme,
+        g_ui.lblInputMode, g_ui.comboInputMode, g_ui.lblCharDelay, g_ui.comboCharDelay,
+        g_ui.lblTheme, g_ui.comboTheme,
         g_ui.lblUiLang, g_ui.comboUiLang,
         g_ui.chkAutoLoad, g_ui.chkCpuOnly, g_ui.chkStartTray, g_ui.chkWinAuto,
         g_ui.chkLivePreview, g_ui.chkOverlay, g_ui.chkToggleMode, g_ui.chkOverwriteClip,
@@ -1956,6 +2026,10 @@ private void installAllTooltips(HWND hwnd, bool add = true) {
         "Per-character — for games/windows blocking Ctrl+V;\r\nClipboard — instant paste;\r\nAuto — <=80 chars per-character, longer via clipboard.",
         "Посимвольно — для игр и окон без Ctrl+V;\r\nБуфер обмена — мгновенная вставка;\r\nАвто — до 80 симв. посимвольно, длиннее через буфер."
     ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboCharDelay, tr(
+        "Pause in ms between per-character keystrokes (raise to 10-50 ms if a game drops characters).",
+        "Задержка в мс между посимвольными нажатиями (увеличьте до 10-50 мс, если игры пропускают буквы)."
+    ), add);
     setTooltipText(hwnd, g_ui.hwndTip, g_ui.comboTheme, tr(
         "Window color theme: Auto (follow Windows), Light, or Dark.",
         "Выбор оформления окна: Авто (следует теме Windows), Светлая или Тёмная."
@@ -2027,6 +2101,7 @@ void uiRefreshLanguage() {
     }
     SetWindowTextW(g_ui.lblTimeout, tr("Auto-unload (memory):", "Автовыгрузка (память):").toUTF16z());
     SetWindowTextW(g_ui.lblInputMode, tr("Input Mode:", "Режим ввода:").toUTF16z());
+    SetWindowTextW(g_ui.lblCharDelay, tr("Char Delay (games):", "Задержка посимвольно:").toUTF16z());
     SetWindowTextW(g_ui.lblTheme, tr("Theme:", "Тема оформления:").toUTF16z());
     SetWindowTextW(g_ui.lblUiLang, tr("UI Language:", "Язык интерфейса:").toUTF16z());
 
@@ -2044,6 +2119,7 @@ void uiRefreshLanguage() {
     populateMicCombo(g_ui.micNames, g_ui.currentMic);
     populateTimeoutCombo(g_ui.currentTimeoutMin);
     populateLocalizedCombo(g_ui.comboInputMode, inputModeOptions, g_ui.currentInputMode);
+    populateCharDelayCombo(g_ui.currentCharDelayMs);
     populateLocalizedCombo(g_ui.comboTheme, themeOptions, g_ui.currentTheme);
     populateOptionCombo(g_ui.comboUiLang, cast(UiOption[]) uiLangOptions, getUiLanguage());
     refreshModelHint();
@@ -2135,6 +2211,12 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_INPUT_MODE, hInst, null);
 
+                g_ui.lblCharDelay = CreateWindowExW(0, "STATIC"w.ptr, tr("Char Delay (games):", "Задержка посимвольно:").toUTF16z(),
+                    WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
+                g_ui.comboCharDelay = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
+                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_COMBO_CHAR_DELAY, hInst, null);
+
                 g_ui.lblTheme = CreateWindowExW(0, "STATIC"w.ptr, tr("Theme:", "Тема оформления:").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.comboTheme = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
@@ -2142,7 +2224,7 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_THEME, hInst, null);
 
                 g_ui.lblUiLang = CreateWindowExW(0, "STATIC"w.ptr, tr("UI Language:", "Язык интерфейса:").toUTF16z(),
-                    WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
+                    WS_CHILD | WS_VISIBLE | SS_RIGHT, 0, 0, 0, 0, hwnd, null, hInst, null);
                 g_ui.comboUiLang = CreateWindowExW(0, "COMBOBOX"w.ptr, ""w.ptr,
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_COMBO_UI_LANG, hInst, null);
@@ -2199,6 +2281,7 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     g_ui.btnHide, g_ui.lblMic, g_ui.comboMic, g_ui.lblModel, g_ui.comboModel,
                     g_ui.btnBrowseModel, g_ui.lblLang, g_ui.comboLang, g_ui.lblHotkey, g_ui.btnHotkey,
                     g_ui.lblTimeout, g_ui.comboTimeout, g_ui.lblInputMode, g_ui.comboInputMode,
+                    g_ui.lblCharDelay, g_ui.comboCharDelay,
                     g_ui.lblTheme, g_ui.comboTheme, g_ui.lblUiLang, g_ui.comboUiLang,
                     g_ui.chkAutoLoad, g_ui.chkCpuOnly,
                     g_ui.chkStartTray, g_ui.chkWinAuto, g_ui.chkLivePreview, g_ui.chkOverlay,
@@ -2387,6 +2470,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyThemeSelection(id - ID_TRAY_THEME_BASE);
                 } else if (id >= ID_TRAY_UI_LANG_BASE && id < ID_TRAY_UI_LANG_BASE + 100) {
                     applyUiLangSelection(id - ID_TRAY_UI_LANG_BASE);
+                } else if (id >= ID_TRAY_CHAR_DELAY_BASE && id < ID_TRAY_CHAR_DELAY_BASE + 100) {
+                    applyCharDelaySelection(id - ID_TRAY_CHAR_DELAY_BASE);
                 } else if (id == ID_COMBO_MIC && code == CBN_SELCHANGE) {
                     int sel = cast(int) SendMessageW(g_ui.comboMic, CB_GETCURSEL, 0, 0);
                     applyMicSelection(sel <= 0 ? -1 : sel - 1);
@@ -2402,6 +2487,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     applyTimeoutSelection(cast(int) SendMessageW(g_ui.comboTimeout, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_COMBO_INPUT_MODE && code == CBN_SELCHANGE) {
                     applyInputModeSelection(cast(int) SendMessageW(g_ui.comboInputMode, CB_GETCURSEL, 0, 0));
+                } else if (id == ID_COMBO_CHAR_DELAY && code == CBN_SELCHANGE) {
+                    applyCharDelaySelection(cast(int) SendMessageW(g_ui.comboCharDelay, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_COMBO_THEME && code == CBN_SELCHANGE) {
                     applyThemeSelection(cast(int) SendMessageW(g_ui.comboTheme, CB_GETCURSEL, 0, 0));
                 } else if (id == ID_COMBO_UI_LANG && code == CBN_SELCHANGE) {
