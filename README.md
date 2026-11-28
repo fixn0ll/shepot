@@ -13,7 +13,8 @@ Push-to-Talk voice dictation tool for Windows x64 written in D (`ldc2`) and Win3
   - `sendinput` — per-character Unicode typing with configurable delay (`charDelayMs` in Settings) for games.
   - `clipboard` — `Ctrl+V` paste (skips overwriting clipboard if it holds an image/files unless enabled).
   - `auto` — `sendinput` for `<= 80` chars, `clipboard` otherwise.
-- **Controls:** Hold (Push-to-Talk) or Toggle mode, global keyboard/mouse hotkey, `Esc` to cancel, system tray icon, floating status HUD, idle model auto-unload, `bin/replacements.json`, and `EN / RU` UI.
+- **Controls:** Hold (Push-to-Talk) or Toggle mode, global keyboard/mouse hotkey, `Esc` to cancel, system tray icon, floating status HUD, idle model auto-unload, `replacements.json`, `EN / RU` UI, and GitHub release update check.
+- **Clean data folder:** standalone/installed `shepot.exe` keeps `config.json`, `replacements.json`, `models/`, and DLLs in `%LOCALAPPDATA%\Shepot` (automatic portable mode if placed alongside `config.json`/DLLs or a `portable` marker file).
 
 ## Build (Windows x64)
 Requires **LDC2** (`dub`) and the **MSVC** linker:

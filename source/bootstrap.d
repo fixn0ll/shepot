@@ -217,7 +217,7 @@ bool downloadModel(string modelPath, void delegate(int pct) onProgress = null) {
     return ok;
 }
 
-private bool downloadFile(string url, string dstPath, void delegate(int pct) onProgress) {
+bool downloadFile(string url, string dstPath, void delegate(int pct) onProgress = null) {
     mkdirRecurse(dirName(dstPath));
     auto partPath = dstPath ~ ".part";
     scope (exit) {

@@ -3,12 +3,15 @@ module config;
 import i18n : normalizeUiLanguage, tr;
 import std.algorithm.searching : canFind, endsWith;
 import std.conv : to;
-import std.file : dirEntries, exists, isDir, readText, SpanMode, thisExePath, write;
+import std.file : dirEntries, exists, isDir, mkdirRecurse, readText, SpanMode, thisExePath, write;
 import std.format : format;
 import std.json : JSONType, JSONValue, parseJSON;
 import std.path : baseName, buildNormalizedPath, buildPath, dirName, isAbsolute;
+import std.process : environment;
 import std.array : replace;
 import std.string : strip, toLower, toUpper;
+
+enum string APP_VERSION = "0.1.3";
 
 struct AppConfig {
     string engine = "whisper";
@@ -180,10 +183,8 @@ void applyModelPreset(ref AppConfig cfg, string optId) {
     cfg.modelPath = optId;
 }
 
-/// Преобразует путь в относительный относительно exeDir(), если файл находится внутри папки приложения.
-string toConfigPath(string p) {
-    auto base = buildNormalizedPath(exeDir());
-    auto norm = buildNormalizedPath(p);
+private string stripPrefixDir(string norm, string baseDir) {
+    auto base = buildNormalizedPath(baseDir);
     version (Windows) {
         auto baseL = base.toLower();
         auto normL = norm.toLower();
@@ -193,6 +194,16 @@ string toConfigPath(string p) {
             return norm[baseL.length + 1 .. $].replace("\\", "/");
         }
     }
+    return "";
+}
+
+/// Преобразует путь в относительный относительно appDataDir() / exeDir(), если файл находится внутри папки данных.
+string toConfigPath(string p) {
+    auto norm = buildNormalizedPath(p);
+    auto relData = stripPrefixDir(norm, appDataDir());
+    if (relData.length > 0) return relData;
+    auto relExe = stripPrefixDir(norm, exeDir());
+    if (relExe.length > 0) return relExe;
     return norm;
 }
 
@@ -368,12 +379,30 @@ string exeDir() {
     return dirName(thisExePath());
 }
 
+/// Включает portable-режим (хранение рядом с exe), если рядом уже есть конфиг, DLL или маркер `portable`.
+bool isPortableMode() {
+    auto ed = exeDir();
+    return exists(buildPath(ed, "portable")) ||
+           exists(buildPath(ed, "config.json")) ||
+           exists(buildPath(ed, "whisper.dll")) ||
+           exists(buildPath(ed, "sherpa-onnx-c-api.dll"));
+}
+
+/// Папка данных приложения: рядом с exe в portable-режиме, иначе `%LOCALAPPDATA%\Shepot`.
+string appDataDir() {
+    if (isPortableMode()) return exeDir();
+    auto localApp = environment.get("LOCALAPPDATA", "");
+    if (localApp.length > 0) return buildPath(localApp, "Shepot");
+    return exeDir();
+}
+
 string resolvePath(string p) {
     if (p.length == 0 || isAbsolute(p)) return p;
+    auto inData = buildPath(appDataDir(), p);
+    if (exists(inData)) return inData;
     auto nearExe = buildPath(exeDir(), p);
     if (exists(nearExe)) return nearExe;
-    if (exists(p)) return p;
-    return nearExe;
+    return inData;
 }
 
 AppConfig loadConfig() {
@@ -385,6 +414,7 @@ AppConfig loadConfig() {
 bool saveConfig(const ref AppConfig cfg) {
     auto path = resolvePath("config.json");
     try {
+        mkdirRecurse(dirName(path));
         write(path, serializeConfigJson(cfg) ~ "\n");
         return true;
     } catch (Exception) {
@@ -649,4 +679,8 @@ unittest {
     assert(detectCustomModelFromFile(buildPath(whOnnxDir, "tiny-encoder.int8.onnx"), det, derr));
     assert(det.engine == "sherpa" && det.sherpaModelType == "whisper");
     assert(det.sherpaJoiner.length == 0 && det.sherpaTokens.endsWith("tiny-tokens.txt"));
+
+    auto stripped = stripPrefixDir(buildNormalizedPath(tmpRoot, "models/test.bin"), tmpRoot);
+    assert(stripped == "models/test.bin");
+    assert(stripPrefixDir(buildNormalizedPath(tmpRoot, "models/test.bin"), buildPath(tmpRoot, "other")) == "");
 }

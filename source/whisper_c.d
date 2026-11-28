@@ -1,9 +1,11 @@
 module whisper_c;
 
 import core.stdc.stdint : int32_t, int64_t, uint32_t;
-import core.sys.windows.winbase : FreeLibrary, GetProcAddress, LoadLibraryW;
+import core.sys.windows.winbase : FreeLibrary, GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH,
+    LoadLibraryExW, LoadLibraryW;
 import core.sys.windows.windef : HMODULE;
 import i18n : tr;
+import std.path : isAbsolute;
 import std.utf : toUTF16z;
 
 // Точное соответствие структурам и enum из c_src/whisper.h
@@ -204,10 +206,13 @@ struct WhisperApi {
     }
 
     bool load(string dllPath, out string err) {
-        m_lib = LoadLibraryW(dllPath.toUTF16z());
+        auto wpath = dllPath.toUTF16z();
+        m_lib = isAbsolute(dllPath)
+            ? LoadLibraryExW(wpath, null, LOAD_WITH_ALTERED_SEARCH_PATH)
+            : LoadLibraryW(wpath);
         if (m_lib is null) {
             err = tr("Failed to load ", "Не удалось загрузить ") ~ dllPath
-                ~ tr(" (check whisper.dll and ggml*.dll next to exe)", " (проверьте наличие whisper.dll и ggml*.dll рядом с exe)");
+                ~ tr(" (check whisper.dll and ggml*.dll)", " (проверьте наличие whisper.dll и ggml*.dll)");
             return false;
         }
 

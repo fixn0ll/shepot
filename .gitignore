@@ -6,3 +6,4 @@ bin/models/*.bin
 bin/*.part
 bin/*.nupkg
 tmp_*
+dist/

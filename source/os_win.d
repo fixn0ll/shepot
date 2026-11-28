@@ -24,6 +24,7 @@ import core.sys.windows.winreg : HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RegCloseK
 import core.sys.windows.winuser;
 import core.thread : Thread;
 import core.time : msecs;
+import config : APP_VERSION, resolvePath;
 import i18n : getUiLanguage, tr;
 import sound : playClickAsync;
 import std.algorithm : max, min;
@@ -39,6 +40,8 @@ private enum uint WM_APP_SYNC = WM_APP + 2;
 private enum uint WM_APP_HOOK_START = WM_APP + 3;
 private enum uint WM_APP_HOOK_STOP = WM_APP + 4;
 private enum uint WM_APP_HOOK_CANCEL = WM_APP + 5;
+private enum uint WM_APP_UPDATE_READY = WM_APP + 6;
+private enum uint WM_APP_EXIT = WM_APP + 7;
 
 private enum int ID_BTN_HIDE = 101;
 private enum int ID_BTN_MODEL = 102;
@@ -68,6 +71,7 @@ private enum int ID_BTN_OPEN_REPL = 125;
 private enum int ID_BTN_OPEN_MODELS = 126;
 private enum int ID_COMBO_UI_LANG = 127;
 private enum int ID_COMBO_CHAR_DELAY = 128;
+private enum int ID_BTN_CHECK_UPDATES = 129;
 
 private enum int ID_TRAY_TOGGLE = 201;
 private enum int ID_TRAY_EXIT = 202;
@@ -82,6 +86,7 @@ private enum int ID_TRAY_COPY_LAST = 210;
 private enum int ID_TRAY_TOGGLE_MODE = 211;
 private enum int ID_TRAY_BROWSE_MODEL = 212;
 private enum int ID_TRAY_OVERWRITE_CLIP = 213;
+private enum int ID_TRAY_CHECK_UPDATES = 214;
 
 private enum int ID_TRAY_MIC_BASE = 1000;
 private enum int ID_TRAY_MODEL_BASE = 2000;
@@ -229,6 +234,8 @@ private struct AppUiState {
     void delegate(bool) onWinAutoChange;
     void delegate() onIdleTick;
     void delegate() onPreviewTick;
+    void delegate() onCheckUpdates;
+    void delegate() onInstallUpdate;
 
     HWND hwnd;
     HWND btnNavMain;
@@ -270,6 +277,7 @@ private struct AppUiState {
     HWND chkOverwriteClip;
     HWND btnOpenReplacements;
     HWND btnOpenModelsDir;
+    HWND btnCheckUpdates;
     HWND lblLog;
     HWND btnCopyLast;
     HWND btnClearLog;
@@ -311,6 +319,11 @@ private struct AppUiState {
     int pendingProgressPct = 0;
     string pendingLastPhrase;
     bool hasPendingLastPhrase;
+    bool hasPendingUpdate;
+    bool pendingUpdateManual;
+    bool pendingUpdateAvailable;
+    string pendingUpdateTag;
+    string pendingUpdateErr;
     string[] pendingLogs;
     bool clickTimerActive;
     bool marqueeActive;
@@ -664,6 +677,29 @@ void uiSetProgress(int mode, int pct = 0) nothrow {
     }
 }
 
+/// Уведомляет UI-поток о результате проверки обновлений на GitHub.
+void uiNotifyUpdateCheck(bool manual, bool available, string latestTag, string err) nothrow {
+    try {
+        if (g_ui.mtx is null || g_ui.hwnd is null) return;
+        g_ui.mtx.lock();
+        g_ui.pendingUpdateManual = manual;
+        g_ui.pendingUpdateAvailable = available;
+        g_ui.pendingUpdateTag = latestTag;
+        g_ui.pendingUpdateErr = err;
+        g_ui.hasPendingUpdate = true;
+        g_ui.mtx.unlock();
+        PostMessageW(g_ui.hwnd, WM_APP_UPDATE_READY, 0, 0);
+    } catch (Throwable) {
+    }
+}
+
+/// Безопасно завершает приложение из любого потока (используется после запуска установщика/апдейтера).
+void uiExitApp() nothrow {
+    if (g_ui.hwnd !is null) {
+        PostMessageW(g_ui.hwnd, WM_APP_EXIT, 0, 0);
+    }
+}
+
 void uiLog(string line) {
     if (g_ui.mtx is null || g_ui.hwnd is null) return;
     g_ui.mtx.lock();
@@ -723,7 +759,9 @@ bool runTrayApp(
     void delegate(bool) onStartTrayChange,
     void delegate(bool) onWinAutoChange,
     void delegate() onIdleTick,
-    void delegate() onPreviewTick
+    void delegate() onPreviewTick,
+    void delegate() onCheckUpdates = null,
+    void delegate() onInstallUpdate = null
 ) {
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = INITCOMMONCONTROLSEX.sizeof;
@@ -785,6 +823,8 @@ bool runTrayApp(
     g_ui.onWinAutoChange = onWinAutoChange;
     g_ui.onIdleTick = onIdleTick;
     g_ui.onPreviewTick = onPreviewTick;
+    g_ui.onCheckUpdates = onCheckUpdates;
+    g_ui.onInstallUpdate = onInstallUpdate;
 
     auto hInst = GetModuleHandleW(null);
     auto clsName = "ShepotWindowClass"w.ptr;
@@ -1206,6 +1246,7 @@ private void layoutChildren(int w, int h) {
     int langComboW = 104;
     int langLabelW = 128;
     int langY = max(sy + 38, h - pad - 24);
+    MoveWindow(g_ui.btnCheckUpdates, pad, langY - 1, 210, 26, TRUE);
     MoveWindow(g_ui.lblUiLang, w - pad - langComboW - 8 - langLabelW, langY + 4, langLabelW, 20, TRUE);
     MoveWindow(g_ui.comboUiLang, w - pad - langComboW, langY, langComboW, 120, TRUE);
 }
@@ -1341,6 +1382,7 @@ private void showTrayMenu(HWND hwnd) {
         ID_TRAY_WIN_AUTO, tr("Run with Windows", "Запускать с Windows").toUTF16z());
 
     AppendMenuW(menu, MF_SEPARATOR, 0, null);
+    AppendMenuW(menu, MF_STRING, ID_TRAY_CHECK_UPDATES, tr("Check for updates...", "Проверить обновления...").toUTF16z());
     AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, tr("Exit", "Выход").toUTF16z());
 
     SetForegroundWindow(hwnd);
@@ -1703,7 +1745,7 @@ private void applyWindowTheme(HWND hwnd) {
                 g_ui.btnNavMain, g_ui.btnNavSettings, g_ui.btnHide, g_ui.btnModel,
                 g_ui.btnBrowseModel, g_ui.btnCopyLast, g_ui.btnClearLog,
                 g_ui.btnHotkey, g_ui.btnOpenReplacements, g_ui.btnOpenModelsDir,
-                g_ui.editLog, g_ui.hwndTip,
+                g_ui.btnCheckUpdates, g_ui.editLog, g_ui.hwndTip,
             ]) {
                 if (c !is null) pTheme(c, expName, null);
             }
@@ -1756,7 +1798,7 @@ private void setActivePage(int page) {
         g_ui.lblUiLang, g_ui.comboUiLang,
         g_ui.chkAutoLoad, g_ui.chkCpuOnly, g_ui.chkStartTray, g_ui.chkWinAuto,
         g_ui.chkLivePreview, g_ui.chkOverlay, g_ui.chkToggleMode, g_ui.chkOverwriteClip,
-        g_ui.btnOpenReplacements, g_ui.btnOpenModelsDir,
+        g_ui.btnOpenReplacements, g_ui.btnOpenModelsDir, g_ui.btnCheckUpdates,
     ]) {
         if (c !is null) ShowWindow(c, swSet);
     }
@@ -1764,9 +1806,10 @@ private void setActivePage(int page) {
 }
 
 private void openReplacementsFile(HWND hwnd) {
-    auto path = buildPath(dirName(thisExePath()), "replacements.json");
+    auto path = resolvePath("replacements.json");
     if (!exists(path)) {
         try {
+            mkdirRecurse(dirName(path));
             write(path, tr("{\n  \"teh\": \"the\"\n}\n", "{\n  \"вишпер\": \"Whisper\"\n}\n"));
         } catch (Exception) {
         }
@@ -1775,7 +1818,7 @@ private void openReplacementsFile(HWND hwnd) {
 }
 
 private void openModelsDir(HWND hwnd) {
-    auto path = buildPath(dirName(thisExePath()), "models");
+    auto path = resolvePath("models");
     try {
         mkdirRecurse(path);
     } catch (Exception) {
@@ -2071,12 +2114,16 @@ private void installAllTooltips(HWND hwnd, bool add = true) {
         "Если выкл.: при наличии картинки/файлов в буфере обмена текст введётся посимвольно без потери картинки.\r\nЕсли вкл.: всегда вставлять через Ctrl+V."
     ), add);
     setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnOpenReplacements, tr(
-        "Open auto-replacements file bin/replacements.json (creates a template if missing).",
-        "Открыть файл автозамен bin/replacements.json (создаёт шаблон при первом открытии)."
+        "Open auto-replacements file replacements.json (creates a template if missing).",
+        "Открыть файл автозамен replacements.json (создаёт шаблон при первом открытии)."
     ), add);
     setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnOpenModelsDir, tr(
-        "Open bin/models/ folder in File Explorer to add custom models.",
-        "Открыть папку bin/models/ в Проводнике для добавления своих моделей."
+        "Open models folder in File Explorer to add custom models.",
+        "Открыть папку моделей в Проводнике для добавления своих моделей."
+    ), add);
+    setTooltipText(hwnd, g_ui.hwndTip, g_ui.btnCheckUpdates, tr(
+        "Check GitHub for a newer release of Shepot.",
+        "Проверить наличие новой версии Shepot на GitHub."
     ), add);
 }
 
@@ -2115,6 +2162,7 @@ void uiRefreshLanguage() {
     SetWindowTextW(g_ui.chkOverwriteClip, tr("Overwrite non-text clipboard", "Заменять нетекстовый буфер").toUTF16z());
     SetWindowTextW(g_ui.btnOpenReplacements, tr("Replacements (replacements.json)", "Словарь замен (replacements.json)").toUTF16z());
     SetWindowTextW(g_ui.btnOpenModelsDir, tr("Open models folder", "Открыть папку моделей").toUTF16z());
+    SetWindowTextW(g_ui.btnCheckUpdates, ("v" ~ APP_VERSION ~ tr(" — Check updates", " — Обновления")).toUTF16z());
 
     populateMicCombo(g_ui.micNames, g_ui.currentMic);
     populateTimeoutCombo(g_ui.currentTimeoutMin);
@@ -2260,6 +2308,9 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                 g_ui.btnOpenModelsDir = CreateWindowExW(0, "BUTTON"w.ptr, tr("Open models folder", "Открыть папку моделей").toUTF16z(),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                     hwnd, cast(HMENU) cast(size_t) ID_BTN_OPEN_MODELS, hInst, null);
+                g_ui.btnCheckUpdates = CreateWindowExW(0, "BUTTON"w.ptr, ("v" ~ APP_VERSION ~ tr(" — Check updates", " — Обновления")).toUTF16z(),
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
+                    hwnd, cast(HMENU) cast(size_t) ID_BTN_CHECK_UPDATES, hInst, null);
 
                 g_ui.lblLog = CreateWindowExW(0, "STATIC"w.ptr, tr("Activity Log:", "Журнал работы:").toUTF16z(),
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, null, hInst, null);
@@ -2286,7 +2337,7 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     g_ui.chkAutoLoad, g_ui.chkCpuOnly,
                     g_ui.chkStartTray, g_ui.chkWinAuto, g_ui.chkLivePreview, g_ui.chkOverlay,
                     g_ui.chkToggleMode, g_ui.chkOverwriteClip,
-                    g_ui.btnOpenReplacements, g_ui.btnOpenModelsDir,
+                    g_ui.btnOpenReplacements, g_ui.btnOpenModelsDir, g_ui.btnCheckUpdates,
                     g_ui.lblLog, g_ui.btnCopyLast, g_ui.btnClearLog
                 ]) {
                     SendMessageW(ctrl, WM_SETFONT, cast(WPARAM) g_ui.fontUi, TRUE);
@@ -2426,6 +2477,8 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
                     openReplacementsFile(hwnd);
                 } else if (id == ID_BTN_OPEN_MODELS) {
                     openModelsDir(hwnd);
+                } else if (id == ID_BTN_CHECK_UPDATES || id == ID_TRAY_CHECK_UPDATES) {
+                    if (g_ui.onCheckUpdates !is null) g_ui.onCheckUpdates();
                 } else if (id == ID_BTN_HOTKEY || id == ID_TRAY_HOTKEY) {
                     g_ui.capturingHotkey = true;
                     SetWindowTextW(g_ui.btnHotkey, tr(
@@ -2536,6 +2589,49 @@ private extern (Windows) LRESULT windowProc(HWND hwnd, UINT msg, WPARAM wParam, 
 
             case WM_APP_HOOK_CANCEL:
                 if (g_ui.onCancel !is null) g_ui.onCancel();
+                return 0;
+
+            case WM_APP_UPDATE_READY:
+                bool manual, avail;
+                string tag, errMsg;
+                g_ui.mtx.lock();
+                bool has = g_ui.hasPendingUpdate;
+                g_ui.hasPendingUpdate = false;
+                manual = g_ui.pendingUpdateManual;
+                avail = g_ui.pendingUpdateAvailable;
+                tag = g_ui.pendingUpdateTag;
+                errMsg = g_ui.pendingUpdateErr;
+                g_ui.mtx.unlock();
+                if (!has) return 0;
+
+                auto updTitle = tr("Shepot — Update", "Shepot — Обновление").toUTF16z();
+                if (errMsg.length > 0) {
+                    if (manual) MessageBoxW(hwnd, errMsg.toUTF16z(), updTitle, MB_OK | MB_ICONWARNING);
+                } else if (avail) {
+                    auto msgText = format(
+                        tr("A new version of Shepot is available: %s (current: v%s).\n\nDownload and install it now?",
+                           "Доступна новая версия Shepot: %s (текущая: v%s).\n\nСкачать и установить сейчас?"),
+                        tag, APP_VERSION
+                    );
+                    if (MessageBoxW(hwnd, msgText.toUTF16z(), updTitle, MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND) == IDYES) {
+                        setActivePage(0);
+                        ShowWindow(hwnd, SW_RESTORE);
+                        SetForegroundWindow(hwnd);
+                        if (g_ui.onInstallUpdate !is null) g_ui.onInstallUpdate();
+                    }
+                } else if (manual) {
+                    auto okText = format(
+                        tr("You already have the latest version (v%s).",
+                           "У вас уже установлена последняя версия (v%s)."),
+                        APP_VERSION
+                    );
+                    MessageBoxW(hwnd, okText.toUTF16z(), updTitle, MB_OK | MB_ICONINFORMATION);
+                }
+                return 0;
+
+            case WM_APP_EXIT:
+                Shell_NotifyIconW(NIM_DELETE, &g_ui.nid);
+                DestroyWindow(hwnd);
                 return 0;
 
             case WM_CLOSE:

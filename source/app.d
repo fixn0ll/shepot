@@ -3,15 +3,17 @@ module app;
 import audio : AudioCapture, listInputDevices;
 import bootstrap : downloadModel, downloadSherpaModel, downloadSherpaRuntime,
     downloadVulkanRuntime, ensureAssets, hasAllStartupAssets, hasRuntimeDll, isSherpaModelReady;
-import config : AppConfig, applyModelPreset, builtinModelPresets, detectCustomModelFromFile,
+import config : APP_VERSION, AppConfig, applyModelPreset, builtinModelPresets, detectCustomModelFromFile,
     loadConfig, modelOptionId, modelRecommendation, normalizeEngine, normalizeInputMode,
     normalizeTheme, parseHotkeyVk, resolvePath, saveConfig, vkToKeyName;
 import core.atomic : atomicLoad, atomicStore;
+import core.sync.mutex : Mutex;
 import core.time : MonoTime;
 import i18n : normalizeUiLanguage, setUiLanguage, tr;
 import os_win : acquireSingleInstance, attachParentConsoleIfAny,
     isWindowsAutostartEnabled, releaseSingleInstance, runTrayApp,
-    setWindowsAutostart, showErrorBox, typeText, uiLog, uiRefreshLanguage, uiSetGpuAvailable,
+    setWindowsAutostart, showErrorBox, typeText, uiExitApp, uiLog, uiNotifyUpdateCheck,
+    uiRefreshLanguage, uiSetGpuAvailable,
     uiSetIdleStatus, uiSetLangOptions, uiSetLastPhrase, uiSetLoadWaiting, uiSetModelOptions,
     uiSetModelState, uiSetProgress, uiSetStatus, uiSetVisual, UiOption, VisualState;
 import postprocess : ReplacementStore;
@@ -25,6 +27,7 @@ import std.stdio : stdout, writeln, writefln;
 import stt : WhisperRecognizer;
 import stt_engine : calcRms, isSpeechValid, SAMPLE_RATE, SttEngine, tailPreview;
 import stt_sherpa : SherpaRecognizer;
+import updater : checkLatestRelease, downloadAndLaunchUpdate, UpdateInfo;
 
 SttEngine createSttEngine(const ref AppConfig cfg) {
     if (normalizeEngine(cfg.engine) == "sherpa") {
@@ -90,6 +93,84 @@ private bool shouldAbortPreview() nothrow {
 
 private shared SharedState g_state;
 private immutable MonoTime g_baseTime;
+private __gshared Mutex g_updMtx;
+private __gshared UpdateInfo g_latestUpd;
+private __gshared bool g_updBusy;
+
+private void updateCheckWorker(bool manual, bool withDelay) {
+    if (withDelay) {
+        import core.thread : Thread;
+        import core.time : msecs;
+        Thread.sleep(1500.msecs);
+        if (atomicLoad(g_state.workerExited)) return;
+    }
+
+    UpdateInfo info;
+    string err;
+    bool ok = checkLatestRelease(APP_VERSION, info, err);
+
+    g_updMtx.lock();
+    if (ok) g_latestUpd = info;
+    g_updBusy = false;
+    g_updMtx.unlock();
+
+    if (atomicLoad(g_state.workerExited)) return;
+    if (ok && info.available) {
+        uiLog(format(tr("[UPD] New version available: %s (current: v%s)", "[UPD] Доступна новая версия: %s (текущая: v%s)"), info.latestTag, APP_VERSION));
+    }
+    uiNotifyUpdateCheck(manual, ok && info.available, info.latestTag, ok ? "" : err);
+}
+
+private void startUpdateCheck(bool manual, bool withDelay = false) {
+    g_updMtx.lock();
+    bool busy = g_updBusy;
+    if (!busy) g_updBusy = true;
+    g_updMtx.unlock();
+    if (busy) return;
+    spawn(&updateCheckWorker, manual, withDelay);
+}
+
+private void updateInstallWorker() {
+    g_updMtx.lock();
+    auto info = g_latestUpd;
+    g_updMtx.unlock();
+
+    scope (exit) {
+        g_updMtx.lock();
+        g_updBusy = false;
+        g_updMtx.unlock();
+    }
+
+    uiSetStatus(format(tr("Downloading update %s: 0%%...", "Скачивание обновления %s: 0%%..."), info.latestTag));
+    uiSetProgress(2, 0);
+    uiLog(format(tr("[UPD] Downloading %s...", "[UPD] Скачивание %s..."), info.latestTag));
+
+    string dlErr;
+    bool ok = downloadAndLaunchUpdate(info, (int pct) {
+        uiSetProgress(2, pct);
+        uiSetStatus(format(tr("Downloading update %s: %s%%...", "Скачивание обновления %s: %s%%..."), info.latestTag, pct));
+    }, dlErr);
+
+    uiSetProgress(0, 0);
+    if (!ok) {
+        uiLog(tr("[UPD ERROR] ", "[UPD ОШИБКА] ") ~ dlErr);
+        uiSetIdleStatus(atomicLoad(g_state.modelLoaded));
+        uiNotifyUpdateCheck(true, false, "", dlErr);
+        return;
+    }
+
+    uiLog(tr("[UPD] Update downloaded, restarting...", "[UPD] Обновление скачано, перезапуск..."));
+    uiExitApp();
+}
+
+private void startUpdateInstall() {
+    g_updMtx.lock();
+    bool busy = g_updBusy;
+    if (!busy) g_updBusy = true;
+    g_updMtx.unlock();
+    if (busy) return;
+    spawn(&updateInstallWorker);
+}
 
 shared static this() {
     g_baseTime = MonoTime.currTime;
@@ -620,6 +701,8 @@ version (unittest) {
         atomicStore(g_state.livePreview, cfg.livePreview);
         atomicStore(g_state.previewBusy, false);
         atomicStore(g_state.workerExited, false);
+        g_updMtx = new Mutex();
+        startUpdateCheck(false, true);
         atomicStore(g_state.unloadTimeoutMin, cfg.unloadTimeoutMin);
         atomicStore(g_state.inputModeCode, encodeInputMode(normalizeInputMode(cfg.inputMode)));
         atomicStore(g_state.charDelayMs, cfg.charDelayMs < 0 ? 0 : cfg.charDelayMs);
@@ -909,6 +992,12 @@ version (unittest) {
                     atomicStore(g_state.previewBusy, true);
                     worker.send(WorkerCmd.preview);
                 }
+            },
+            () {
+                startUpdateCheck(true, false);
+            },
+            () {
+                startUpdateInstall();
             }
         );
         return ok ? 0 : 1;
